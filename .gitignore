@@ -1,0 +1,14 @@
+.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+.DS_Store
+venv/
+env/
+.venv/
+.vscode/
+.idea/
+*.swp
+*.swo
+*.csv
+*.xlsx
+!assets/sample_data.csv
