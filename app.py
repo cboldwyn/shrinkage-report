@@ -279,7 +279,13 @@ def append_to_sheets(df, worksheet_name):
     client = get_gspread_client()
     sheet = client.open_by_url(SHEETS_URL)
     ws = sheet.worksheet(worksheet_name)
-    rows = df.values.tolist()
+    # Convert NaN/NaT to empty strings for JSON serialization
+    clean = df.fillna("").astype(str)
+    # Restore numeric columns as numbers (not strings)
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            clean[col] = df[col].fillna(0)
+    rows = clean.values.tolist()
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
