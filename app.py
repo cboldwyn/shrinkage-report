@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -172,6 +172,37 @@ def get_week_id(dt):
 def get_month_id(dt):
     """Year-month string from a date (e.g. '2026-03')."""
     return f"{dt.year}-{dt.month:02d}"
+
+
+def week_id_to_label(week_id):
+    """Convert '2026-W13' to 'Mar 23 - Mar 29' for human-readable display."""
+    try:
+        from datetime import date as date_cls
+        year, week = int(week_id.split("-W")[0]), int(week_id.split("-W")[1])
+        monday = date_cls.fromisocalendar(year, week, 1)
+        sunday = monday + timedelta(days=6)
+        if monday.month == sunday.month:
+            return f"{monday.strftime('%b %d')} - {sunday.strftime('%d')}"
+        return f"{monday.strftime('%b %d')} - {sunday.strftime('%b %d')}"
+    except Exception:
+        return week_id
+
+
+def month_id_to_label(month_id):
+    """Convert '2026-03' to 'March 2026'."""
+    try:
+        from datetime import date as date_cls
+        year, month = int(month_id.split("-")[0]), int(month_id.split("-")[1])
+        return date_cls(year, month, 1).strftime("%B %Y")
+    except Exception:
+        return month_id
+
+
+def period_label(period_id, period_key="weekly"):
+    """Human-readable label for a period ID."""
+    if period_key == "weekly":
+        return week_id_to_label(period_id)
+    return month_id_to_label(period_id)
 
 
 def get_reasons_for_report(report_name, custom_groups=None):
@@ -724,19 +755,42 @@ def download_buttons(df, label, key_prefix):
 # ============================================================================
 
 
+def render_group_table(recon_df, sales_by_store, reasons, group_name, description, key):
+    """Render a store-level adjustment table for a reason group."""
+    store_agg, _, _ = aggregate_adjustments(recon_df, reasons)
+    if store_agg.empty:
+        st.caption(f"No {group_name.lower()} adjustments this period.")
+        return
+    merged = merge_with_sales(store_agg, sales_by_store, on_cols=["Store"])
+    if not merged.empty:
+        merged["_s"] = merged["Store"].map(store_sort_key)
+        merged = merged.sort_values("_s").drop(columns="_s")
+    net = merged["Net_Adjustment"].sum()
+    count = int(merged["Adjustments"].sum())
+    st.markdown(f"**{group_name}** -- {description}")
+    st.metric(f"Total {group_name}", f"${net:,.2f} ({count} adjustments)")
+    cols = ["Store", "Adjustments", "Net_Adjustment", "Store Sales COGS", "Shrinkage %"]
+    avail = [c for c in cols if c in merged.columns]
+    fmt = {"Net_Adjustment": "${:,.2f}", "Store Sales COGS": "${:,.2f}", "Shrinkage %": "{:.2%}"}
+    styled = merged[avail].style.format(
+        {k: v for k, v in fmt.items() if k in avail}, na_rep="N/A"
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    download_buttons(merged[avail], f"{group_name.lower()}_by_store", key)
+
+
 def main():
     st.title(f"📉 Shrinkage Dashboard v{VERSION}")
 
     sheets_ok = has_sheets_config()
 
     # ----------------------------------------------------------------
-    # Load persisted data (or init empty)
+    # Load persisted data
     # ----------------------------------------------------------------
     if sheets_ok:
         all_recon = load_recon_from_sheets()
         all_sales = load_sales_from_sheets()
     else:
-        # Session-state fallback for local dev / no sheets configured
         all_recon = st.session_state.get("recon_data", pd.DataFrame())
         all_sales = st.session_state.get("sales_data", pd.DataFrame())
 
@@ -745,39 +799,21 @@ def main():
     # ----------------------------------------------------------------
     # Sidebar
     # ----------------------------------------------------------------
-    st.sidebar.header("📊 Report Settings")
-
-    # Report type
-    report_type = st.sidebar.selectbox(
-        "Report Type",
-        options=list(REPORT_PRESETS.keys()) + ["Custom"],
-        index=0,
-        help="Which adjustment reasons to include in the analysis.",
-    )
-
-    custom_groups = None
-    if report_type == "Custom":
-        custom_groups = st.sidebar.multiselect(
-            "Select reason groups:",
-            options=list(REASON_GROUPS.keys()),
-            default=["Shrinkage"],
-        )
-
-    include_reasons = get_reasons_for_report(report_type, custom_groups)
-
-    # Show which reasons are active
-    with st.sidebar.expander("Active reasons"):
-        st.caption(", ".join(include_reasons) if include_reasons else "None selected")
+    st.sidebar.header("📊 Dashboard")
 
     # Period toggle
-    period = st.sidebar.radio(
-        "Period", ["Weekly", "Monthly"], horizontal=True
-    )
+    period = st.sidebar.radio("View by", ["Weekly", "Monthly"], horizontal=True)
     period_key = "weekly" if period == "Weekly" else "monthly"
 
-    # Period selector for tables
+    # Period selector with human-readable labels
     selected_period = None
-    if has_data and "_date" in all_recon.columns:
+    periods_available = []
+    prev_period = None
+    if has_data:
+        if "_date" not in all_recon.columns:
+            all_recon["_date"] = pd.to_datetime(
+                all_recon["Date"], format="mixed", errors="coerce"
+            )
         recon_dates = all_recon["_date"].dropna()
         if not recon_dates.empty:
             if period_key == "weekly":
@@ -788,27 +824,28 @@ def main():
                 periods_available = sorted(
                     recon_dates.apply(get_month_id).unique(), reverse=True
                 )
-
             if periods_available:
                 selected_period = st.sidebar.selectbox(
-                    f"Select {period} (for tables)",
+                    "Period",
                     options=periods_available,
                     index=0,
+                    format_func=lambda x: period_label(x, period_key),
                 )
+                # Get previous period for comparisons
+                idx = periods_available.index(selected_period)
+                if idx < len(periods_available) - 1:
+                    prev_period = periods_available[idx + 1]
 
     st.sidebar.markdown("---")
 
-    # ----------------------------------------------------------------
     # Upload section
-    # ----------------------------------------------------------------
     st.sidebar.header("📂 Upload Data")
-
     if has_data:
-        # Show data coverage
         recon_weeks = sorted(all_recon.get("week_id", pd.Series()).dropna().unique())
         if recon_weeks:
             st.sidebar.success(
-                f"{len(recon_weeks)} week(s): {recon_weeks[0]} to {recon_weeks[-1]}"
+                f"{len(recon_weeks)} weeks loaded: "
+                f"{week_id_to_label(recon_weeks[0])} to {week_id_to_label(recon_weeks[-1])}"
             )
 
     file_recon = st.sidebar.file_uploader(
@@ -819,81 +856,43 @@ def main():
         "Total Sales Detail", type=["csv"], key="upload_sales",
         help="Blaze > Data Export > Total Sales Detail",
     )
-
     if file_recon and file_sales:
         if st.sidebar.button("Upload & Process", type="primary"):
             with st.spinner("Processing uploads..."):
                 recon_upload = load_recon_csv(file_recon)
                 sales_upload = load_sales_csv(file_sales)
-
                 if recon_upload is not None and sales_upload is not None:
-                    upload_weeks = set(
-                        recon_upload["week_id"].dropna().unique()
-                    )
-
-                    # Check for duplicates
+                    upload_weeks = set(recon_upload["week_id"].dropna().unique())
                     if sheets_ok:
                         existing = get_stored_week_ids()
                         dupes = upload_weeks & existing
                         if dupes:
                             st.sidebar.warning(
-                                f"Data for {', '.join(sorted(dupes))} already exists. "
-                                "Skipping duplicate weeks."
+                                f"Skipping existing: {', '.join(week_id_to_label(w) for w in sorted(dupes))}"
                             )
-                            recon_upload = recon_upload[
-                                ~recon_upload["week_id"].isin(dupes)
-                            ]
-                            sales_upload = sales_upload[
-                                ~sales_upload["week_id"].isin(dupes)
-                            ]
-
+                            recon_upload = recon_upload[~recon_upload["week_id"].isin(dupes)]
+                            sales_upload = sales_upload[~sales_upload["week_id"].isin(dupes)]
                     if not recon_upload.empty:
                         if sheets_ok:
                             append_to_sheets(recon_upload, RECON_WORKSHEET)
                             append_to_sheets(sales_upload, SALES_WORKSHEET)
-                            # Clear cache to reload fresh data
                             load_recon_from_sheets.clear()
                             load_sales_from_sheets.clear()
                         else:
-                            # Session-state fallback
-                            prev_recon = st.session_state.get(
-                                "recon_data", pd.DataFrame()
-                            )
-                            prev_sales = st.session_state.get(
-                                "sales_data", pd.DataFrame()
-                            )
-                            st.session_state["recon_data"] = pd.concat(
-                                [prev_recon, recon_upload], ignore_index=True
-                            )
-                            st.session_state["sales_data"] = pd.concat(
-                                [prev_sales, sales_upload], ignore_index=True
-                            )
-
-                        st.sidebar.success(
-                            f"Uploaded {len(upload_weeks)} week(s): "
-                            f"{', '.join(sorted(upload_weeks))}"
-                        )
+                            prev_r = st.session_state.get("recon_data", pd.DataFrame())
+                            prev_s = st.session_state.get("sales_data", pd.DataFrame())
+                            st.session_state["recon_data"] = pd.concat([prev_r, recon_upload], ignore_index=True)
+                            st.session_state["sales_data"] = pd.concat([prev_s, sales_upload], ignore_index=True)
+                        st.sidebar.success(f"Uploaded {len(upload_weeks)} week(s)")
                         st.rerun()
                     else:
-                        st.sidebar.info("No new data to upload (all weeks already exist).")
+                        st.sidebar.info("No new data to upload.")
 
-    # Version info
     st.sidebar.markdown("---")
-    with st.sidebar.expander("Version History"):
-        st.markdown("""
-        **v2.0.0** (2026-04-14)
-        - Google Sheets persistence
-        - Report presets with reason groupings
-        - Weekly/monthly trend charts
-        - Fixed shrinkage calculation (OVERSOLD+UNDERSOLD only)
-
-        **v1.0.0** (2026-03-31)
-        - Initial release
-        """)
     st.sidebar.caption(f"v{VERSION}")
 
     # ----------------------------------------------------------------
-    # Reload data after potential upload
+    # Reload after upload
     # ----------------------------------------------------------------
     if sheets_ok:
         all_recon = load_recon_from_sheets()
@@ -901,316 +900,327 @@ def main():
     else:
         all_recon = st.session_state.get("recon_data", pd.DataFrame())
         all_sales = st.session_state.get("sales_data", pd.DataFrame())
-
     has_data = not all_recon.empty and not all_sales.empty
 
     if not has_data:
-        st.info(
-            "Upload Inventory Reconciliation History and Total Sales Detail CSVs "
-            "in the sidebar to get started."
-        )
-        if not sheets_ok and SHEETS_URL == "":
-            st.warning(
-                "Google Sheets not configured. Data will only persist for this session. "
-                "Set SHEETS_URL and configure google_sheets secrets for persistence."
-            )
+        st.info("Upload Inventory Reconciliation History and Total Sales Detail CSVs in the sidebar to get started.")
         return
 
-    # Ensure _date column exists
     if "_date" not in all_recon.columns:
-        all_recon["_date"] = pd.to_datetime(
-            all_recon["Date"], format="mixed", errors="coerce"
-        )
+        all_recon["_date"] = pd.to_datetime(all_recon["Date"], format="mixed", errors="coerce")
     if "Store" not in all_recon.columns:
         all_recon["Store"] = all_recon["Shop"].map(short_store_name)
 
     # ----------------------------------------------------------------
-    # Filter data for selected period (tables)
+    # Filter to selected period
     # ----------------------------------------------------------------
-    if selected_period and period_key == "weekly":
-        period_recon = all_recon[all_recon["week_id"] == selected_period]
-        period_sales = all_sales[all_sales["week_id"] == selected_period]
-    elif selected_period and period_key == "monthly":
-        all_recon["_month"] = all_recon["_date"].apply(
-            lambda d: get_month_id(d) if pd.notna(d) else None
-        )
-        period_recon = all_recon[all_recon["_month"] == selected_period]
-        # Aggregate sales across weeks in the selected month
-        all_sales_copy = all_sales.copy()
-        from datetime import date as date_cls
-        def week_to_month(wid):
-            if pd.isna(wid) or not isinstance(wid, str) or "-W" not in wid:
-                return None
-            try:
-                year, week = int(wid.split("-W")[0]), int(wid.split("-W")[1])
-                d = date_cls.fromisocalendar(year, week, 1)
-                return f"{d.year}-{d.month:02d}"
-            except Exception:
-                return None
-        all_sales_copy["_month"] = all_sales_copy["week_id"].apply(week_to_month)
-        period_sales = (
-            all_sales_copy[all_sales_copy["_month"] == selected_period]
-            .groupby(["Store", "Category"], as_index=False)["Sales COGS"]
-            .sum()
-        )
-    else:
-        period_recon = all_recon
-        period_sales = all_sales
+    from datetime import date as date_cls
 
-    # ----------------------------------------------------------------
-    # Process data
-    # ----------------------------------------------------------------
-    # Trend data (uses ALL periods, not just selected)
-    trend_data = build_period_trend(
-        all_recon, all_sales, period=period_key, include_reasons=include_reasons
-    )
-    reason_trend = build_reason_trend(all_recon, period=period_key)
+    def week_to_month(wid):
+        if pd.isna(wid) or not isinstance(wid, str) or "-W" not in wid:
+            return None
+        try:
+            y, w = int(wid.split("-W")[0]), int(wid.split("-W")[1])
+            d = date_cls.fromisocalendar(y, w, 1)
+            return f"{d.year}-{d.month:02d}"
+        except Exception:
+            return None
 
-    # Table data (uses selected period)
-    store_summary, cat_detail, emp_detail = aggregate_adjustments(
-        period_recon, include_reasons
+    def get_period_data(recon, sales, pid, pkey):
+        if not pid:
+            return recon, sales
+        if pkey == "weekly":
+            return recon[recon["week_id"] == pid], sales[sales["week_id"] == pid]
+        recon_c = recon.copy()
+        recon_c["_month"] = recon_c["_date"].apply(lambda d: get_month_id(d) if pd.notna(d) else None)
+        sales_c = sales.copy()
+        sales_c["_month"] = sales_c["week_id"].apply(week_to_month)
+        return (
+            recon_c[recon_c["_month"] == pid],
+            sales_c[sales_c["_month"] == pid].groupby(["Store", "Category"], as_index=False)["Sales COGS"].sum(),
+        )
+
+    period_recon, period_sales = get_period_data(all_recon, all_sales, selected_period, period_key)
+
+    # Also get previous period for insights
+    prev_recon, prev_sales = get_period_data(all_recon, all_sales, prev_period, period_key) if prev_period else (pd.DataFrame(), pd.DataFrame())
+
+    # Sales by store (for merging)
+    sales_by_store = period_sales.groupby("Store", as_index=False)["Sales COGS"].sum().rename(
+        columns={"Sales COGS": "Store Sales COGS"}
     )
 
-    # Sales aggregations for merging
-    if "Category" in period_sales.columns:
-        sales_by_cat = period_sales.groupby(
-            ["Store", "Category"], as_index=False
-        )["Sales COGS"].sum()
-    elif "Product Category" in period_sales.columns:
-        sales_by_cat = (
-            period_sales.groupby(["Store", "Product Category"], as_index=False)
-            ["Sales COGS"].sum()
-            .rename(columns={"Product Category": "Category"})
-        )
-    else:
-        sales_by_cat = pd.DataFrame()
-
-    sales_by_store = period_sales.groupby(
-        "Store", as_index=False
-    )["Sales COGS"].sum().rename(columns={"Sales COGS": "Store Sales COGS"})
-
-    # Merge
-    store_merged = merge_with_sales(store_summary, sales_by_store, on_cols=["Store"])
-    cat_merged = merge_with_sales(cat_detail, sales_by_cat, on_cols=["Store", "Category"])
-
-    # Sort
-    if not store_merged.empty:
-        store_merged["_sort"] = store_merged["Store"].map(store_sort_key)
-        store_merged = store_merged.sort_values("_sort").drop(columns="_sort")
-    if not cat_merged.empty:
-        cat_merged["_sort"] = cat_merged["Store"].map(store_sort_key)
-        cat_merged = cat_merged.sort_values(
-            ["_sort", "Net_Adjustment"]
-        ).drop(columns="_sort")
-    if not emp_detail.empty:
-        emp_detail["_sort"] = emp_detail["Store"].map(store_sort_key)
-        emp_detail = emp_detail.sort_values(
-            ["_sort", "Net_Adjustment"]
-        ).drop(columns="_sort")
-
     # ----------------------------------------------------------------
-    # Header metrics
+    # Header
     # ----------------------------------------------------------------
-    st.markdown(f"**Report:** {report_type} | **Period:** {selected_period or 'All'}")
+    sel_label = period_label(selected_period, period_key) if selected_period else "All Data"
+    st.markdown(f"### {sel_label}")
 
-    if not store_merged.empty:
-        net_adj = store_merged["Net_Adjustment"].sum()
-        net_cogs = store_merged.get("Store Sales COGS", pd.Series([0])).sum()
+    # Shrinkage headline metrics
+    shrinkage_reasons = get_reasons_for_report("Shrinkage")
+    shrink_store, _, _ = aggregate_adjustments(period_recon, shrinkage_reasons)
+    shrink_merged = merge_with_sales(shrink_store, sales_by_store, on_cols=["Store"])
+
+    if not shrink_merged.empty:
+        net_adj = shrink_merged["Net_Adjustment"].sum()
+        net_cogs = shrink_merged.get("Store Sales COGS", pd.Series([0])).sum()
         net_pct = net_adj / net_cogs if net_cogs != 0 else None
+
+        # Previous period delta
+        delta_str = None
+        if not prev_recon.empty and not prev_sales.empty:
+            prev_sales_store = prev_sales.groupby("Store", as_index=False)["Sales COGS"].sum().rename(
+                columns={"Sales COGS": "Store Sales COGS"}
+            )
+            prev_shrink, _, _ = aggregate_adjustments(prev_recon, shrinkage_reasons)
+            prev_merged = merge_with_sales(prev_shrink, prev_sales_store, on_cols=["Store"])
+            if not prev_merged.empty:
+                prev_adj = prev_merged["Net_Adjustment"].sum()
+                prev_cogs = prev_merged.get("Store Sales COGS", pd.Series([0])).sum()
+                prev_pct = prev_adj / prev_cogs if prev_cogs != 0 else None
+                if prev_pct is not None and net_pct is not None:
+                    delta_str = f"{(net_pct - prev_pct):.2%} vs prior"
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Net Adjustment", format_currency(net_adj))
+            st.metric("Shrinkage (Net)", format_currency(net_adj), delta=delta_str, delta_color="inverse")
         with col2:
-            st.metric("Total Sales COGS", format_currency(net_cogs))
+            st.metric("Sales COGS", format_currency(net_cogs))
         with col3:
-            st.metric("Network Shrinkage %", format_pct(net_pct))
+            st.metric("Shrinkage Rate", format_pct(net_pct))
 
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Trends",
-        "📊 Location Summary",
-        "📂 Category Detail",
-        "👤 Employee Breakdown",
+        "📊 Shrinkage by Location",
+        "📦 Adjustments",
+        "👤 Employees",
         "📄 Raw Data",
     ])
 
     # == Tab 1: Trends ==
     with tab1:
+        trend_data = build_period_trend(
+            all_recon, all_sales, period=period_key,
+            include_reasons=shrinkage_reasons,
+        )
         build_network_trend(trend_data)
-
         build_store_trend(trend_data)
 
-        if report_type == "All Adjustments":
-            build_reason_composition(reason_trend)
+        st.markdown("---")
+        st.subheader("All Adjustment Types Over Time")
+        reason_trend = build_reason_trend(all_recon, period=period_key)
+        build_reason_composition(reason_trend)
 
-        if not cat_merged.empty:
-            build_top_categories(cat_merged)
-
-    # == Tab 2: Location Summary ==
+    # == Tab 2: Shrinkage by Location ==
     with tab2:
-        if store_merged.empty:
-            st.info("No adjustment data for this period/report type.")
+        st.markdown(
+            "**Shrinkage** measures unexplained inventory variances: "
+            "items that appear (**oversold**, positive) or go missing "
+            "(**undersold**, negative) with no documented cause. "
+            "This excludes known adjustments like samples, display waste, and damaged goods."
+        )
+        if shrink_merged.empty:
+            st.info("No shrinkage data for this period.")
         else:
+            if not shrink_merged.empty:
+                shrink_merged["_sort"] = shrink_merged["Store"].map(store_sort_key)
+                shrink_merged = shrink_merged.sort_values("_sort").drop(columns="_sort")
+
             display_cols = [
                 "Store", "Adjustments", "Gains", "Losses",
                 "Net_Adjustment", "Store Sales COGS", "Shrinkage %",
             ]
-            avail = [c for c in display_cols if c in store_merged.columns]
-            display_df = store_merged[avail].copy()
+            avail = [c for c in display_cols if c in shrink_merged.columns]
+            display_df = shrink_merged[avail].copy()
 
-            # Grand total row
-            totals = {"Store": "GRAND TOTAL"}
-            for c in ["Adjustments", "Gains", "Losses", "Net_Adjustment"]:
-                if c in display_df.columns:
+            # Rename columns for readability
+            col_rename = {
+                "Gains": "Overages ($)",
+                "Losses": "Shortages ($)",
+                "Net_Adjustment": "Net ($)",
+                "Store Sales COGS": "Sales COGS ($)",
+                "Shrinkage %": "Rate",
+            }
+            display_df = display_df.rename(columns={k: v for k, v in col_rename.items() if k in display_df.columns})
+
+            # Grand total
+            totals = {"Store": "NETWORK TOTAL"}
+            for c in display_df.columns:
+                if c == "Store":
+                    continue
+                if c == "Rate":
+                    net = display_df["Net ($)"].sum() if "Net ($)" in display_df.columns else 0
+                    cogs = display_df["Sales COGS ($)"].sum() if "Sales COGS ($)" in display_df.columns else 0
+                    totals[c] = net / cogs if cogs != 0 else None
+                elif c == "Adjustments":
+                    totals[c] = int(display_df[c].sum())
+                else:
                     totals[c] = display_df[c].sum()
-            if "Store Sales COGS" in display_df.columns:
-                totals["Store Sales COGS"] = display_df["Store Sales COGS"].sum()
-                t_cogs = totals["Store Sales COGS"]
-                totals["Shrinkage %"] = (
-                    totals["Net_Adjustment"] / t_cogs if t_cogs != 0 else None
-                )
-            display_with_total = pd.concat(
-                [display_df, pd.DataFrame([totals])], ignore_index=True
-            )
 
-            styled = style_shrinkage_table(display_with_total)
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-            download_buttons(display_with_total, "location_summary", "loc")
-
-    # == Tab 3: Category Detail ==
-    with tab3:
-        if cat_merged.empty:
-            st.info("No category data for this period/report type.")
-        else:
-            stores_available = sorted(
-                cat_merged["Store"].unique(), key=store_sort_key
-            )
-            selected_stores = st.multiselect(
-                "Filter by location:",
-                options=stores_available,
-                default=stores_available,
-                key="cat_store_filter",
-            )
-            filtered_cat = cat_merged[
-                cat_merged["Store"].isin(selected_stores)
-            ].copy()
-
-            display_cols = [
-                "Store", "Category", "Adjustments",
-                "Net_Adjustment", "Sales COGS", "Shrinkage %",
-            ]
-            avail = [c for c in display_cols if c in filtered_cat.columns]
-            cat_display = filtered_cat[avail].copy()
+            display_with_total = pd.concat([display_df, pd.DataFrame([totals])], ignore_index=True)
 
             fmt = {
-                "Net_Adjustment": "${:,.2f}",
-                "Sales COGS": "${:,.2f}",
-                "Shrinkage %": "{:.2%}",
+                "Overages ($)": "${:,.2f}",
+                "Shortages ($)": "${:,.2f}",
+                "Net ($)": "${:,.2f}",
+                "Sales COGS ($)": "${:,.2f}",
+                "Rate": "{:.2%}",
             }
-            styled_cat = cat_display.style.format(
-                {k: v for k, v in fmt.items() if k in cat_display.columns},
-                na_rep="N/A",
-            )
-            st.dataframe(styled_cat, use_container_width=True, hide_index=True)
-            st.caption(f"{len(cat_display)} rows")
-            download_buttons(cat_display, "category_detail", "cat")
 
-    # == Tab 4: Employee Breakdown ==
-    with tab4:
-        if emp_detail.empty:
-            st.info("No employee data for this period/report type.")
-        else:
-            # Merge store-level COGS for employee %
-            emp_with_cogs = emp_detail.merge(
-                sales_by_store, on="Store", how="left"
+            def color_rate(val):
+                if pd.isna(val):
+                    return ""
+                if abs(val) > 0.05:
+                    return "background-color: #ffcccc"
+                if abs(val) > 0.02:
+                    return "background-color: #fff3cd"
+                return ""
+
+            styled = display_with_total.style.format(
+                {k: v for k, v in fmt.items() if k in display_with_total.columns}, na_rep="N/A"
             )
+            if "Rate" in display_with_total.columns:
+                styled = styled.map(color_rate, subset=["Rate"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # Insights: notable store changes vs prior period
+            if not prev_recon.empty and not prev_sales.empty:
+                prev_sales_store = prev_sales.groupby("Store", as_index=False)["Sales COGS"].sum().rename(
+                    columns={"Sales COGS": "Store Sales COGS"}
+                )
+                prev_shrink, _, _ = aggregate_adjustments(prev_recon, shrinkage_reasons)
+                prev_merged = merge_with_sales(prev_shrink, prev_sales_store, on_cols=["Store"])
+                if not prev_merged.empty:
+                    comp = shrink_merged.merge(
+                        prev_merged[["Store", "Net_Adjustment"]],
+                        on="Store", suffixes=("", "_prev"), how="inner",
+                    )
+                    comp["change"] = comp["Net_Adjustment"] - comp["Net_Adjustment_prev"]
+                    notable = comp[comp["change"].abs() > 50].sort_values("change")
+                    if not notable.empty:
+                        prev_label = period_label(prev_period, period_key)
+                        st.markdown(f"**Notable changes vs {prev_label}:**")
+                        for _, r in notable.iterrows():
+                            direction = "increased" if r["change"] < 0 else "improved"
+                            st.markdown(
+                                f"- **{r['Store']}**: shrinkage {direction} by "
+                                f"${abs(r['change']):,.2f} "
+                                f"(was ${r['Net_Adjustment_prev']:,.2f}, now ${r['Net_Adjustment']:,.2f})"
+                            )
+
+            download_buttons(display_with_total, "shrinkage_by_location", "shrink")
+
+    # == Tab 3: Adjustments ==
+    with tab3:
+        st.markdown(
+            "Inventory adjustments grouped by cause. These are **not shrinkage** "
+            "but expected business operations like samples given out, display waste, "
+            "damaged goods, expired products, and returns."
+        )
+
+        render_group_table(
+            period_recon, sales_by_store,
+            REASON_GROUPS["Samples"], "Samples",
+            "Product given as samples (team meetings, promos, vendor samples).",
+            "samp",
+        )
+        st.markdown("---")
+        render_group_table(
+            period_recon, sales_by_store,
+            REASON_GROUPS["Display"], "Display Waste",
+            "Display floor items disposed per Haven Waste SOP.",
+            "disp",
+        )
+        st.markdown("---")
+        render_group_table(
+            period_recon, sales_by_store,
+            REASON_GROUPS["Damaged"], "Damaged",
+            "Products damaged in-store (broken jars, defective units).",
+            "dmg",
+        )
+        st.markdown("---")
+        render_group_table(
+            period_recon, sales_by_store,
+            REASON_GROUPS["Expired"], "Expired",
+            "Products pulled due to expiration.",
+            "exp",
+        )
+        st.markdown("---")
+        render_group_table(
+            period_recon, sales_by_store,
+            REASON_GROUPS["Other"], "Other",
+            "Returns, waste disposal, audit corrections, and quantity fixes.",
+            "oth",
+        )
+
+    # == Tab 4: Employees ==
+    with tab4:
+        st.markdown(
+            "Employee-level shrinkage adjustments (oversold + undersold only). "
+            "High adjustment counts or values may indicate training needs or process gaps."
+        )
+        _, _, emp_detail = aggregate_adjustments(period_recon, shrinkage_reasons)
+        if emp_detail.empty:
+            st.info("No employee shrinkage data for this period.")
+        else:
+            emp_with_cogs = emp_detail.merge(sales_by_store, on="Store", how="left")
             emp_with_cogs["% of Store COGS"] = emp_with_cogs.apply(
                 lambda r: r["Net_Adjustment"] / r["Store Sales COGS"]
-                if pd.notna(r.get("Store Sales COGS"))
-                and r.get("Store Sales COGS", 0) != 0
-                else None,
-                axis=1,
+                if pd.notna(r.get("Store Sales COGS")) and r.get("Store Sales COGS", 0) != 0
+                else None, axis=1,
             )
+            emp_with_cogs["_s"] = emp_with_cogs["Store"].map(store_sort_key)
+            emp_with_cogs = emp_with_cogs.sort_values(["_s", "Net_Adjustment"]).drop(columns="_s")
 
-            stores_emp = sorted(
-                emp_with_cogs["Store"].unique(), key=store_sort_key
-            )
+            stores_emp = sorted(emp_with_cogs["Store"].unique(), key=store_sort_key)
             selected_emp_stores = st.multiselect(
-                "Filter by location:",
-                options=stores_emp,
-                default=stores_emp,
-                key="emp_store_filter",
+                "Filter by location:", options=stores_emp, default=stores_emp, key="emp_store_filter",
             )
-            filtered_emp = emp_with_cogs[
-                emp_with_cogs["Store"].isin(selected_emp_stores)
-            ].copy()
+            filtered_emp = emp_with_cogs[emp_with_cogs["Store"].isin(selected_emp_stores)]
 
-            display_cols = [
-                "Store", "Employee Name", "Adjustments",
-                "Gains", "Losses", "Net_Adjustment", "% of Store COGS",
-            ]
+            display_cols = ["Store", "Employee Name", "Adjustments", "Gains", "Losses", "Net_Adjustment", "% of Store COGS"]
             avail = [c for c in display_cols if c in filtered_emp.columns]
-            emp_display = filtered_emp[avail].copy()
-
-            fmt_emp = {
-                "Gains": "${:,.2f}",
-                "Losses": "${:,.2f}",
-                "Net_Adjustment": "${:,.2f}",
-                "% of Store COGS": "{:.2%}",
-            }
-            styled_emp = emp_display.style.format(
-                {k: v for k, v in fmt_emp.items() if k in emp_display.columns},
-                na_rep="N/A",
+            fmt_emp = {"Gains": "${:,.2f}", "Losses": "${:,.2f}", "Net_Adjustment": "${:,.2f}", "% of Store COGS": "{:.2%}"}
+            styled_emp = filtered_emp[avail].style.format(
+                {k: v for k, v in fmt_emp.items() if k in avail}, na_rep="N/A"
             )
             st.dataframe(styled_emp, use_container_width=True, hide_index=True)
-            st.caption(f"{len(emp_display)} rows")
-            download_buttons(emp_display, "employee_breakdown", "emp")
+            st.caption(f"{len(filtered_emp)} employees")
+            download_buttons(filtered_emp[avail], "employee_shrinkage", "emp")
 
     # == Tab 5: Raw Data ==
     with tab5:
+        st.markdown("All inventory adjustment rows for the selected period. Use filters to drill down.")
         raw = period_recon.copy()
-        if include_reasons:
-            raw = raw[raw["Reason"].isin(include_reasons)]
-
-        # Filters
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
             shop_filter = st.multiselect(
-                "Store:",
-                options=sorted(raw["Store"].dropna().unique(), key=store_sort_key),
-                key="raw_shop",
+                "Store:", options=sorted(raw["Store"].dropna().unique(), key=store_sort_key), key="raw_shop",
             )
         with col_f2:
-            cat_filter = st.multiselect(
-                "Category:",
-                options=sorted(raw["Category Name"].dropna().unique()),
-                key="raw_cat",
+            reason_filter = st.multiselect(
+                "Reason:", options=sorted(raw["Reason"].dropna().unique()), key="raw_reason",
             )
         with col_f3:
-            reason_filter = st.multiselect(
-                "Reason:",
-                options=sorted(raw["Reason"].dropna().unique()),
-                key="raw_reason",
+            cat_filter = st.multiselect(
+                "Category:", options=sorted(raw["Category Name"].dropna().unique()), key="raw_cat",
             )
-
         if shop_filter:
             raw = raw[raw["Store"].isin(shop_filter)]
-        if cat_filter:
-            raw = raw[raw["Category Name"].isin(cat_filter)]
         if reason_filter:
             raw = raw[raw["Reason"].isin(reason_filter)]
+        if cat_filter:
+            raw = raw[raw["Category Name"].isin(cat_filter)]
 
         display_raw_cols = [
-            "Date", "Store", "Employee Name", "Inventory Name",
-            "Product Name", "Brand Name", "Category Name",
+            "Date", "Store", "Employee Name", "Product Name", "Category Name",
             "Difference", "Cost per Unit", "COGS", "Reason", "Reason Note",
         ]
         avail_raw = [c for c in display_raw_cols if c in raw.columns]
         raw_display = raw[avail_raw].reset_index(drop=True)
-
         st.dataframe(raw_display, use_container_width=True, hide_index=True)
         st.caption(f"{len(raw_display)} rows")
         download_buttons(raw_display, "raw_data", "raw")
