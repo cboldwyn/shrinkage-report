@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.0.0"
+VERSION = "2.0.2"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
