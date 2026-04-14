@@ -27,7 +27,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from google.oauth2.service_account import Credentials
@@ -92,28 +92,19 @@ ALL_REASONS = [
     "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
 ]
 
+# Parent groups per reason mapping. "Billed" = billed to vendor.
 REASON_GROUPS = {
-    "Shrinkage": ["OVERSOLD", "UNDERSOLD"],
-    "Samples": ["SAMPLES"],
-    "Display": ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],
-    "Damaged": ["DAMAGED"],
-    "Expired": ["WASTE_EXPIRED"],
-    "Incorrect Qty": ["INCORRECT_QUANTITY"],
-    "Other": [
-        "WASTE_RETURN", "WASTE_DISPOSAL", "AUDIT",
-        "OTHER", "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
-    ],
+    "Shrinkage":  ["OVERSOLD", "UNDERSOLD", "INCORRECT_QUANTITY", "AUDIT"],  # Not Billed
+    "Samples":    ["SAMPLES"],                                                # Not Billed
+    "Display":    ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],                        # Billed
+    "Defective":  ["WASTE_RETURN", "DAMAGED", "WASTE_DISPOSAL"],              # Billed
+    "Expired":    ["WASTE_EXPIRED"],                                           # Billed
+    "Recall":     ["PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR"],  # Billed
+    "Other":      ["OTHER"],                                                   # Not Billed
 }
 
-REPORT_PRESETS = {
-    "Shrinkage": ["Shrinkage"],
-    "All Adjustments": list(REASON_GROUPS.keys()),
-    "Samples": ["Samples"],
-    "Display": ["Display"],
-    "Damaged": ["Damaged"],
-    "Expired": ["Expired"],
-    "Other": ["Other"],
-}
+BILLED_GROUPS = {"Display", "Defective", "Expired", "Recall"}
+NOT_BILLED_GROUPS = {"Shrinkage", "Samples", "Other"}
 
 # -- Haven branding --
 COLOR_PRIMARY = "#3DC0CC"
@@ -124,8 +115,9 @@ GROUP_COLORS = {
     "Shrinkage": COLOR_PRIMARY,
     "Samples": "#8E44AD",
     "Display": COLOR_ACCENT,
-    "Damaged": COLOR_ALERT,
+    "Defective": COLOR_ALERT,
     "Expired": "#E67E22",
+    "Recall": "#2C3E50",
     "Other": "#95A5A6",
 }
 
@@ -1085,57 +1077,49 @@ def main():
 
             download_buttons(display_with_total, "shrinkage_by_location", "shrink")
 
+            # Breakdown by individual reason within Shrinkage
+            shrink_filtered = period_recon[period_recon["Reason"].isin(REASON_GROUPS["Shrinkage"])]
+            if not shrink_filtered.empty:
+                st.subheader("By Reason")
+                reason_breakdown = (
+                    shrink_filtered.groupby("Reason")
+                    .agg(Adjustments=("COGS", "count"), Total=("COGS", "sum"))
+                    .sort_values("Total")
+                    .reset_index()
+                )
+                fmt_rb = {"Total": "${:,.2f}"}
+                st.dataframe(
+                    reason_breakdown.style.format(fmt_rb, na_rep="N/A"),
+                    use_container_width=True, hide_index=True,
+                )
+
     # == Tab 3: Adjustments ==
     with tab3:
-        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Samples"], "Samples", "samp")
-        st.markdown("---")
-        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Display"], "Display", "disp")
-        st.markdown("---")
-        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Damaged"], "Damaged", "dmg")
-        st.markdown("---")
-        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Expired"], "Expired", "exp")
-        st.markdown("---")
+        adj_groups = [
+            ("Display", "disp"),
+            ("Defective", "def"),
+            ("Samples", "samp"),
+            ("Expired", "exp"),
+            ("Recall", "rec"),
+            ("Other", "oth"),
+        ]
+        for i, (gname, key) in enumerate(adj_groups):
+            if i > 0:
+                st.markdown("---")
+            render_group_table(period_recon, sales_by_store, REASON_GROUPS[gname], gname, key)
 
-        # Other: headline + detail breakdown by individual reason
-        st.subheader("Other")
-        other_net, other_count = compute_group_total(period_recon, REASON_GROUPS["Other"])
-        st.metric("Network Total", f"${other_net:,.2f} ({other_count} adjustments)")
-
-        other_filtered = period_recon[period_recon["Reason"].isin(REASON_GROUPS["Other"])]
-        if not other_filtered.empty:
-            # Breakdown by individual reason across network
-            reason_breakdown = (
-                other_filtered.groupby("Reason")
-                .agg(Adjustments=("COGS", "count"), Total=("COGS", "sum"))
-                .sort_values("Total")
-                .reset_index()
-            )
-            st.markdown("**By reason:**")
-            fmt_rb = {"Total": "${:,.2f}"}
-            st.dataframe(
-                reason_breakdown.style.format(fmt_rb, na_rep="N/A"),
-                use_container_width=True, hide_index=True,
-            )
-
-            # By store
-            st.markdown("**By store:**")
-            other_by_store = (
-                other_filtered.groupby("Store")
-                .agg(Adjustments=("COGS", "count"), Net_Adjustment=("COGS", "sum"))
-                .reset_index()
-            )
-            other_by_store = merge_with_sales(other_by_store, sales_by_store, on_cols=["Store"])
-            if not other_by_store.empty:
-                other_by_store["_s"] = other_by_store["Store"].map(store_sort_key)
-                other_by_store = other_by_store.sort_values("_s").drop(columns="_s")
-            cols = ["Store", "Adjustments", "Net_Adjustment", "Store Sales COGS", "Shrinkage %"]
-            avail = [c for c in cols if c in other_by_store.columns]
-            fmt_o = {"Net_Adjustment": "${:,.2f}", "Store Sales COGS": "${:,.2f}", "Shrinkage %": "{:.2%}"}
-            st.dataframe(
-                other_by_store[avail].style.format({k: v for k, v in fmt_o.items() if k in avail}, na_rep="N/A"),
-                use_container_width=True, hide_index=True,
-            )
-            download_buttons(other_by_store[avail], "other_by_store", "oth")
+        # Handle blank/no-reason entries
+        no_reason = period_recon[
+            period_recon["Reason"].isna() | (period_recon["Reason"].str.strip() == "")
+        ] if not period_recon.empty else pd.DataFrame()
+        if not no_reason.empty:
+            st.markdown("---")
+            st.subheader("No Reason")
+            nr_net = no_reason["COGS"].sum()
+            st.metric("Network Total", f"${nr_net:,.2f} ({len(no_reason)} adjustments)")
+            nr_cols = ["Date", "Store", "Employee Name", "Product Name", "Difference", "COGS", "Reason Note"]
+            avail_nr = [c for c in nr_cols if c in no_reason.columns]
+            st.dataframe(no_reason[avail_nr], use_container_width=True, hide_index=True)
 
     # == Tab 4: Incorrect Quantity ==
     with tab4:
