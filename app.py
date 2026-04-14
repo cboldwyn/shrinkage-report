@@ -205,8 +205,12 @@ def get_reasons_for_report(report_name, custom_groups=None):
     """Return flat list of reason strings for a report type."""
     if report_name == "Custom" and custom_groups:
         groups = custom_groups
+    elif report_name in REASON_GROUPS:
+        return list(REASON_GROUPS[report_name])
+    elif report_name == "All Adjustments":
+        groups = list(REASON_GROUPS.keys())
     else:
-        groups = REPORT_PRESETS.get(report_name, ["Shrinkage"])
+        groups = ["Shrinkage"]
     reasons = []
     for g in groups:
         reasons.extend(REASON_GROUPS.get(g, []))
