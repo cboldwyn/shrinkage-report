@@ -275,10 +275,16 @@ def get_stored_week_ids():
 
 
 def append_to_sheets(df, worksheet_name):
-    """Append rows to a Google Sheets worksheet."""
+    """Append rows to a Google Sheets worksheet. Writes headers if sheet is empty."""
     client = get_gspread_client()
     sheet = client.open_by_url(SHEETS_URL)
     ws = sheet.worksheet(worksheet_name)
+
+    # Write header row if the sheet is empty
+    existing = ws.get_all_values()
+    if not existing:
+        ws.append_row(df.columns.tolist(), value_input_option="USER_ENTERED")
+
     # Convert NaN/NaT to empty strings for JSON serialization
     clean = df.fillna("").astype(str)
     # Restore numeric columns as numbers (not strings)
