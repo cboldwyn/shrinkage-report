@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -98,8 +98,9 @@ REASON_GROUPS = {
     "Display": ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],
     "Damaged": ["DAMAGED"],
     "Expired": ["WASTE_EXPIRED"],
+    "Incorrect Qty": ["INCORRECT_QUANTITY"],
     "Other": [
-        "WASTE_RETURN", "WASTE_DISPOSAL", "AUDIT", "INCORRECT_QUANTITY",
+        "WASTE_RETURN", "WASTE_DISPOSAL", "AUDIT",
         "OTHER", "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
     ],
 }
@@ -168,9 +169,10 @@ def format_pct(val):
 
 
 def get_week_id(dt):
-    """ISO year-week string from a date (e.g. '2026-W13')."""
-    iso = dt.isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
+    """Sunday-Saturday business week ID. Returns Sunday's date as 'YYYY-MM-DD'."""
+    days_since_sunday = (dt.weekday() + 1) % 7
+    sunday = dt - timedelta(days=days_since_sunday)
+    return sunday.strftime("%Y-%m-%d")
 
 
 def get_month_id(dt):
@@ -179,15 +181,13 @@ def get_month_id(dt):
 
 
 def week_id_to_label(week_id):
-    """Convert '2026-W13' to 'Mar 23 - Mar 29' for human-readable display."""
+    """Convert week_id to 'Dec 28 - Jan 03' label."""
     try:
-        from datetime import date as date_cls
-        year, week = int(week_id.split("-W")[0]), int(week_id.split("-W")[1])
-        monday = date_cls.fromisocalendar(year, week, 1)
-        sunday = monday + timedelta(days=6)
-        if monday.month == sunday.month:
-            return f"{monday.strftime('%b %d')} - {sunday.strftime('%d')}"
-        return f"{monday.strftime('%b %d')} - {sunday.strftime('%b %d')}"
+        sunday = datetime.strptime(week_id, "%Y-%m-%d").date()
+        saturday = sunday + timedelta(days=6)
+        if sunday.month == saturday.month:
+            return f"{sunday.strftime('%b %d')} - {saturday.strftime('%d')}"
+        return f"{sunday.strftime('%b %d')} - {saturday.strftime('%b %d')}"
     except Exception:
         return week_id
 
@@ -195,8 +195,8 @@ def week_id_to_label(week_id):
 def month_id_to_label(month_id):
     """Convert '2026-03' to 'March 2026'."""
     try:
-        from datetime import date as date_cls
         year, month = int(month_id.split("-")[0]), int(month_id.split("-")[1])
+        from datetime import date as date_cls
         return date_cls(year, month, 1).strftime("%B %Y")
     except Exception:
         return month_id
@@ -500,20 +500,15 @@ def build_period_trend(recon_df, sales_df, period="weekly", include_reasons=None
     else:
         # Derive month from week_id for sales data
         sales_period = sales_df.copy()
-        # Parse week_id to get approximate month
-        def week_to_month(wid):
+        def week_to_month_inner(wid):
             if pd.isna(wid) or not isinstance(wid, str):
                 return None
             try:
-                year = int(wid.split("-W")[0])
-                week = int(wid.split("-W")[1])
-                # Approximate: ISO week 1 starts ~Jan 4
-                from datetime import date
-                d = date.fromisocalendar(year, week, 1)
+                d = datetime.strptime(wid, "%Y-%m-%d").date()
                 return f"{d.year}-{d.month:02d}"
             except Exception:
                 return None
-        sales_period["period_id"] = sales_period["week_id"].apply(week_to_month)
+        sales_period["period_id"] = sales_period["week_id"].apply(week_to_month_inner)
 
     sales_agg = (
         sales_period.groupby(["period_id", "Store"], as_index=False)["Sales COGS"]
@@ -925,11 +920,10 @@ def main():
     from datetime import date as date_cls
 
     def week_to_month(wid):
-        if pd.isna(wid) or not isinstance(wid, str) or "-W" not in wid:
+        if pd.isna(wid) or not isinstance(wid, str):
             return None
         try:
-            y, w = int(wid.split("-W")[0]), int(wid.split("-W")[1])
-            d = date_cls.fromisocalendar(y, w, 1)
+            d = datetime.strptime(wid, "%Y-%m-%d").date()
             return f"{d.year}-{d.month:02d}"
         except Exception:
             return None
@@ -969,34 +963,38 @@ def main():
     shrink_store, _, _ = aggregate_adjustments(period_recon, shrinkage_reasons)
     shrink_merged = merge_with_sales(shrink_store, sales_by_store, on_cols=["Store"])
 
-    shrink_net, shrink_count = compute_group_total(period_recon, REASON_GROUPS["Shrinkage"])
-    samples_net, _ = compute_group_total(period_recon, REASON_GROUPS["Samples"])
-    display_net, _ = compute_group_total(period_recon, REASON_GROUPS["Display"])
-    damaged_net, _ = compute_group_total(period_recon, REASON_GROUPS["Damaged"])
-    expired_net, _ = compute_group_total(period_recon, REASON_GROUPS["Expired"])
-    other_net, _ = compute_group_total(period_recon, REASON_GROUPS["Other"])
+    # Per-group totals
+    group_totals = {}
+    for gname, greasons in REASON_GROUPS.items():
+        net, count = compute_group_total(period_recon, greasons)
+        group_totals[gname] = {"net": net, "count": count}
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
-        st.metric("Shrinkage", format_currency(shrink_net))
-    with col2:
-        st.metric("Samples", format_currency(samples_net))
-    with col3:
-        st.metric("Display", format_currency(display_net))
-    with col4:
-        st.metric("Damaged", format_currency(damaged_net))
-    with col5:
-        st.metric("Expired", format_currency(expired_net))
-    with col6:
-        st.metric("Other", format_currency(other_net))
+    # Total across everything
+    total_net = sum(g["net"] for g in group_totals.values())
+    total_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
+    total_pct = total_net / total_cogs if total_cogs != 0 else None
+
+    # Headline: total adjustments
+    st.metric("Total Adjustments", f"{format_currency(total_net)} ({format_pct(total_pct)} of COGS)")
+
+    # Sub-headlines: each group with % of COGS
+    group_names = list(REASON_GROUPS.keys())
+    cols = st.columns(len(group_names))
+    for i, gname in enumerate(group_names):
+        net = group_totals[gname]["net"]
+        pct = net / total_cogs if total_cogs != 0 else None
+        with cols[i]:
+            st.metric(gname, format_currency(net))
+            st.caption(format_pct(pct) + " of COGS" if pct is not None else "")
 
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📈 Trends",
         "📊 Shrinkage by Location",
         "📦 Adjustments",
+        "🔢 Incorrect Quantity",
         "👤 Employees",
         "📄 Raw Data",
     ])
@@ -1017,6 +1015,10 @@ def main():
 
     # == Tab 2: Shrinkage by Location ==
     with tab2:
+        st.caption(
+            "Shrinkage = unexplained inventory variances (oversold + undersold). "
+            "Excludes known adjustments like samples, display waste, and damaged goods."
+        )
         if shrink_merged.empty:
             st.info("No shrinkage data for this period.")
         else:
@@ -1135,8 +1137,56 @@ def main():
             )
             download_buttons(other_by_store[avail], "other_by_store", "oth")
 
-    # == Tab 4: Employees ==
+    # == Tab 4: Incorrect Quantity ==
     with tab4:
+        iq_reasons = REASON_GROUPS["Incorrect Qty"]
+        iq_filtered = period_recon[period_recon["Reason"].isin(iq_reasons)] if not period_recon.empty else period_recon
+
+        if iq_filtered.empty:
+            st.info("No incorrect quantity adjustments this period.")
+        else:
+            iq_net = iq_filtered["COGS"].sum()
+            iq_count = len(iq_filtered)
+            st.metric("Network Total", f"${iq_net:,.2f} ({iq_count} adjustments)")
+
+            # Summary by store
+            st.subheader("By Store")
+            iq_store = (
+                iq_filtered.groupby("Store")
+                .agg(Adjustments=("COGS", "count"), Net_Adjustment=("COGS", "sum"))
+                .reset_index()
+            )
+            iq_store_merged = merge_with_sales(iq_store, sales_by_store, on_cols=["Store"])
+            if not iq_store_merged.empty:
+                iq_store_merged["_s"] = iq_store_merged["Store"].map(store_sort_key)
+                iq_store_merged = iq_store_merged.sort_values("_s").drop(columns="_s")
+            cols_iq = ["Store", "Adjustments", "Net_Adjustment", "Store Sales COGS", "Shrinkage %"]
+            avail_iq = [c for c in cols_iq if c in iq_store_merged.columns]
+            fmt_iq = {"Net_Adjustment": "${:,.2f}", "Store Sales COGS": "${:,.2f}", "Shrinkage %": "{:.2%}"}
+            st.dataframe(
+                iq_store_merged[avail_iq].style.format(
+                    {k: v for k, v in fmt_iq.items() if k in avail_iq}, na_rep="N/A"
+                ),
+                use_container_width=True, hide_index=True,
+            )
+
+            # Detail view
+            st.subheader("Detail")
+            detail_cols = [
+                "Date", "Store", "Employee Name", "Product Name", "Category Name",
+                "Difference", "Cost per Unit", "COGS", "Reason Note",
+            ]
+            avail_detail = [c for c in detail_cols if c in iq_filtered.columns]
+            iq_detail = iq_filtered[avail_detail].copy()
+            if not iq_detail.empty:
+                iq_detail["_s"] = iq_filtered["Store"].map(store_sort_key)
+                iq_detail = iq_detail.sort_values(["_s", "Date"]).drop(columns="_s")
+            st.dataframe(iq_detail, use_container_width=True, hide_index=True)
+            st.caption(f"{len(iq_detail)} adjustments")
+            download_buttons(iq_detail, "incorrect_quantity_detail", "iq")
+
+    # == Tab 5: Employees ==
+    with tab5:
         _, _, emp_detail = aggregate_adjustments(period_recon, shrinkage_reasons)
         if emp_detail.empty:
             st.info("No employee shrinkage data for this period.")
@@ -1166,8 +1216,8 @@ def main():
             st.caption(f"{len(filtered_emp)} employees")
             download_buttons(filtered_emp[avail], "employee_shrinkage", "emp")
 
-    # == Tab 5: Raw Data ==
-    with tab5:
+    # == Tab 6: Raw Data ==
+    with tab6:
         raw = period_recon.copy()
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
