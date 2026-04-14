@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -92,19 +92,28 @@ ALL_REASONS = [
     "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
 ]
 
-# Parent groups per reason mapping. "Billed" = billed to vendor.
+# Parent groups per reason mapping.
+# "Not Billed" = costs Haven bears. "Billed" = recovered from vendor.
 REASON_GROUPS = {
-    "Shrinkage":  ["OVERSOLD", "UNDERSOLD", "INCORRECT_QUANTITY", "AUDIT"],  # Not Billed
-    "Samples":    ["SAMPLES"],                                                # Not Billed
-    "Display":    ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],                        # Billed
-    "Defective":  ["WASTE_RETURN", "DAMAGED", "WASTE_DISPOSAL"],              # Billed
-    "Expired":    ["WASTE_EXPIRED"],                                           # Billed
-    "Recall":     ["PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR"],  # Billed
-    "Other":      ["OTHER"],                                                   # Not Billed
+    # Not Billed (Haven's cost)
+    "Shrinkage":  ["OVERSOLD", "UNDERSOLD", "INCORRECT_QUANTITY", "AUDIT"],
+    "Samples":    ["SAMPLES"],
+    "Other":      ["OTHER"],
+    # Billed to Vendor
+    "DDE":        ["WASTE_DISPLAY", "DISPLAY_SAMPLE", "WASTE_RETURN", "DAMAGED",
+                   "WASTE_DISPOSAL", "WASTE_EXPIRED"],
+    "Recall":     ["PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR"],
 }
 
-BILLED_GROUPS = {"Display", "Defective", "Expired", "Recall"}
-NOT_BILLED_GROUPS = {"Shrinkage", "Samples", "Other"}
+NOT_BILLED_GROUPS = ["Shrinkage", "Samples", "Other"]
+BILLED_GROUPS = ["DDE", "Recall"]
+
+# DDE sub-groups for detail breakdown
+DDE_SUBGROUPS = {
+    "Display":   ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],
+    "Defective": ["WASTE_RETURN", "DAMAGED", "WASTE_DISPOSAL"],
+    "Expired":   ["WASTE_EXPIRED"],
+}
 
 # -- Haven branding --
 COLOR_PRIMARY = "#3DC0CC"
@@ -114,11 +123,12 @@ COLOR_ALERT = "#9E1F63"
 GROUP_COLORS = {
     "Shrinkage": COLOR_PRIMARY,
     "Samples": "#8E44AD",
+    "DDE": COLOR_ACCENT,
+    "Recall": "#2C3E50",
+    "Other": "#95A5A6",
     "Display": COLOR_ACCENT,
     "Defective": COLOR_ALERT,
     "Expired": "#E67E22",
-    "Recall": "#2C3E50",
-    "Other": "#95A5A6",
 }
 
 
@@ -566,43 +576,59 @@ def apply_period_labels(fig, period_ids):
     fig.update_xaxes(ticktext=labels, tickvals=unique, tickangle=-45)
 
 
+def filter_partial_weeks(trend_data):
+    """Drop weeks with less than 50% of median sales COGS (partial data)."""
+    if trend_data.empty:
+        return trend_data
+    weekly_cogs = trend_data.groupby("period_id")["Sales COGS"].sum()
+    median_cogs = weekly_cogs.median()
+    if median_cogs <= 0:
+        return trend_data
+    full_weeks = weekly_cogs[weekly_cogs >= median_cogs * 0.5].index
+    return trend_data[trend_data["period_id"].isin(full_weeks)]
+
+
 def build_network_trend(trend_data):
-    """Network-level shrinkage % over time with rolling average."""
+    """Network-level shrinkage rate over time (higher = worse)."""
     if trend_data.empty:
         st.info("Not enough data for trend charts. Upload more weeks.")
         return
 
+    data = filter_partial_weeks(trend_data)
     network = (
-        trend_data.groupby("period_id", as_index=False)
+        data.groupby("period_id", as_index=False)
         .agg({"Net_Adjustment": "sum", "Sales COGS": "sum"})
     )
-    network["Shrinkage %"] = network.apply(
-        lambda r: r["Net_Adjustment"] / r["Sales COGS"]
+    # Show as positive rate (higher = more shrinkage = worse)
+    network["Shrinkage Rate"] = network.apply(
+        lambda r: abs(r["Net_Adjustment"]) / r["Sales COGS"]
+        if r["Sales COGS"] != 0 and r["Net_Adjustment"] < 0 else
+        -abs(r["Net_Adjustment"]) / r["Sales COGS"]
         if r["Sales COGS"] != 0 else None, axis=1
     )
-    network = network.dropna(subset=["Shrinkage %"]).sort_values("period_id")
+    network = network.dropna(subset=["Shrinkage Rate"]).sort_values("period_id")
     if network.empty:
         return
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=network["period_id"], y=network["Shrinkage %"],
-        mode="lines+markers", name="Shrinkage %",
-        line=dict(color=COLOR_PRIMARY, width=2),
+        x=network["period_id"], y=network["Shrinkage Rate"],
+        mode="lines+markers", name="Shrinkage Rate",
+        line=dict(color=COLOR_ALERT, width=2),
         hovertemplate="%{x}: %{y:.2%}<extra></extra>",
     ))
     if len(network) >= 4:
-        rolling = network["Shrinkage %"].rolling(4, min_periods=4).mean()
+        rolling = network["Shrinkage Rate"].rolling(4, min_periods=4).mean()
         fig.add_trace(go.Scatter(
             x=network["period_id"], y=rolling,
             mode="lines", name="4-period avg",
-            line=dict(dash="dash", width=1, color=COLOR_PRIMARY),
+            line=dict(dash="dash", width=1, color=COLOR_ALERT),
             opacity=0.5, showlegend=True,
         ))
     fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
     apply_period_labels(fig, network["period_id"])
     fig.update_layout(
-        title="Network Shrinkage % Over Time",
+        title="Network Shrinkage Rate (higher = worse)",
         height=400, yaxis_tickformat=".2%",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
@@ -611,24 +637,29 @@ def build_network_trend(trend_data):
 
 
 def build_store_trend(trend_data):
-    """Per-store shrinkage % over time."""
+    """Per-store shrinkage rate over time (higher = worse)."""
     if trend_data.empty:
         return
-    data = trend_data.dropna(subset=["Shrinkage %"]).copy()
+    data = filter_partial_weeks(trend_data)
+    data = data.dropna(subset=["Shrinkage %"]).copy()
     if data.empty:
         return
+    # Invert: positive = loss (worse)
+    data["Shrinkage Rate"] = data["Shrinkage %"].apply(
+        lambda v: abs(v) if v < 0 else -abs(v)
+    )
     data["_sort"] = data["Store"].map(store_sort_key)
     data = data.sort_values(["_sort", "period_id"])
 
     fig = px.line(
-        data, x="period_id", y="Shrinkage %", color="Store",
+        data, x="period_id", y="Shrinkage Rate", color="Store",
         markers=True,
-        labels={"period_id": "Period", "Shrinkage %": "Shrinkage %"},
+        labels={"period_id": "Period", "Shrinkage Rate": "Shrinkage Rate"},
     )
     fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
     apply_period_labels(fig, data["period_id"])
     fig.update_layout(
-        title="Shrinkage % by Store",
+        title="Shrinkage Rate by Store (higher = worse)",
         height=500, yaxis_tickformat=".2%",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=-0.35),
@@ -965,23 +996,37 @@ def main():
         net, count = compute_group_total(period_recon, greasons)
         group_totals[gname] = {"net": net, "count": count}
 
-    # Total across everything
-    total_net = sum(g["net"] for g in group_totals.values())
     total_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
-    total_pct = total_net / total_cogs if total_cogs != 0 else None
 
-    # Headline: total adjustments
-    st.metric("Total Adjustments", f"{format_currency(total_net)} ({format_pct(total_pct)} of COGS)")
+    # Haven's cost = not billed groups only
+    haven_cost = sum(group_totals[g]["net"] for g in NOT_BILLED_GROUPS if g in group_totals)
+    haven_pct = haven_cost / total_cogs if total_cogs != 0 else None
 
-    # Sub-headlines: each group with % of COGS
-    group_names = list(REASON_GROUPS.keys())
-    cols = st.columns(len(group_names))
-    for i, gname in enumerate(group_names):
-        net = group_totals[gname]["net"]
+    # Billed to vendor
+    billed_total = sum(group_totals[g]["net"] for g in BILLED_GROUPS if g in group_totals)
+
+    # Headlines: Haven's cost (what actually costs us)
+    st.markdown("**Haven's Cost** (not recovered from vendors)")
+    h_cols = st.columns(len(NOT_BILLED_GROUPS) + 1)
+    with h_cols[0]:
+        st.metric("Total", f"{format_currency(haven_cost)}")
+        st.caption(f"{format_pct(haven_pct)} of COGS")
+    for i, gname in enumerate(NOT_BILLED_GROUPS):
+        net = group_totals.get(gname, {}).get("net", 0)
         pct = net / total_cogs if total_cogs != 0 else None
-        with cols[i]:
+        with h_cols[i + 1]:
             st.metric(gname, format_currency(net))
             st.caption(format_pct(pct) + " of COGS" if pct is not None else "")
+
+    # Billed to vendor (separate, less alarming)
+    st.markdown("**Billed to Vendor** (recovered)")
+    b_cols = st.columns(len(BILLED_GROUPS) + 1)
+    with b_cols[0]:
+        st.metric("Total", format_currency(billed_total))
+    for i, gname in enumerate(BILLED_GROUPS):
+        net = group_totals.get(gname, {}).get("net", 0)
+        with b_cols[i + 1]:
+            st.metric(gname, format_currency(net))
 
     # ----------------------------------------------------------------
     # Tabs
@@ -1099,18 +1144,28 @@ def main():
 
     # == Tab 3: Adjustments ==
     with tab3:
-        adj_groups = [
-            ("Display", "disp"),
-            ("Defective", "def"),
-            ("Samples", "samp"),
-            ("Expired", "exp"),
-            ("Recall", "rec"),
-            ("Other", "oth"),
-        ]
-        for i, (gname, key) in enumerate(adj_groups):
-            if i > 0:
-                st.markdown("---")
-            render_group_table(period_recon, sales_by_store, REASON_GROUPS[gname], gname, key)
+        # DDE (Display, Defective, Expired) - billed to vendor
+        st.subheader("DDE (Display, Defective, Expired)")
+        dde_net, dde_count = compute_group_total(period_recon, REASON_GROUPS["DDE"])
+        st.metric("Network Total", f"${dde_net:,.2f} ({dde_count} adjustments)")
+        st.caption("Billed to vendor")
+
+        # Break out DDE sub-groups
+        for sub_name, sub_reasons in DDE_SUBGROUPS.items():
+            sub_filtered = period_recon[period_recon["Reason"].isin(sub_reasons)] if not period_recon.empty else pd.DataFrame()
+            if not sub_filtered.empty:
+                sub_net = sub_filtered["COGS"].sum()
+                st.markdown(f"**{sub_name}**: ${sub_net:,.2f} ({len(sub_filtered)} adjustments)")
+
+        # DDE by store
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["DDE"], "DDE by Store", "dde")
+
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Samples"], "Samples", "samp")
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Recall"], "Recall", "rec")
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Other"], "Other", "oth")
 
         # Handle blank/no-reason entries
         no_reason = period_recon[
@@ -1127,7 +1182,7 @@ def main():
 
     # == Tab 4: Incorrect Quantity ==
     with tab4:
-        iq_reasons = REASON_GROUPS["Incorrect Qty"]
+        iq_reasons = ["INCORRECT_QUANTITY"]
         iq_filtered = period_recon[period_recon["Reason"].isin(iq_reasons)] if not period_recon.empty else period_recon
 
         if iq_filtered.empty:
