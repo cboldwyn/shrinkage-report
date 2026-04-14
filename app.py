@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -88,7 +88,8 @@ SALES_REQUIRED_COLS = ["Date", "Shop", "Product Category", "COGS"]
 ALL_REASONS = [
     "OVERSOLD", "UNDERSOLD", "DAMAGED", "WASTE_DISPLAY", "DISPLAY_SAMPLE",
     "SAMPLES", "WASTE_EXPIRED", "WASTE_RETURN", "WASTE_DISPOSAL",
-    "AUDIT", "INCORRECT_QUANTITY",
+    "AUDIT", "INCORRECT_QUANTITY", "OTHER",
+    "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
 ]
 
 REASON_GROUPS = {
@@ -97,7 +98,10 @@ REASON_GROUPS = {
     "Display": ["WASTE_DISPLAY", "DISPLAY_SAMPLE"],
     "Damaged": ["DAMAGED"],
     "Expired": ["WASTE_EXPIRED"],
-    "Other": ["WASTE_RETURN", "WASTE_DISPOSAL", "AUDIT", "INCORRECT_QUANTITY"],
+    "Other": [
+        "WASTE_RETURN", "WASTE_DISPOSAL", "AUDIT", "INCORRECT_QUANTITY",
+        "OTHER", "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
+    ],
 }
 
 REPORT_PRESETS = {
@@ -563,13 +567,20 @@ def build_reason_trend(recon_df, period="weekly"):
 # ============================================================================
 
 
+def apply_period_labels(fig, period_ids):
+    """Replace raw period_id x-axis ticks with human-readable date labels."""
+    unique = sorted(set(str(p) for p in period_ids if pd.notna(p)))
+    pkey = "weekly" if any("-W" in p for p in unique) else "monthly"
+    labels = [period_label(p, pkey) for p in unique]
+    fig.update_xaxes(ticktext=labels, tickvals=unique, tickangle=-45)
+
+
 def build_network_trend(trend_data):
     """Network-level shrinkage % over time with rolling average."""
     if trend_data.empty:
         st.info("Not enough data for trend charts. Upload more weeks.")
         return
 
-    # Aggregate across all stores per period
     network = (
         trend_data.groupby("period_id", as_index=False)
         .agg({"Net_Adjustment": "sum", "Sales COGS": "sum"})
@@ -579,7 +590,6 @@ def build_network_trend(trend_data):
         if r["Sales COGS"] != 0 else None, axis=1
     )
     network = network.dropna(subset=["Shrinkage %"]).sort_values("period_id")
-
     if network.empty:
         return
 
@@ -590,8 +600,6 @@ def build_network_trend(trend_data):
         line=dict(color=COLOR_PRIMARY, width=2),
         hovertemplate="%{x}: %{y:.2%}<extra></extra>",
     ))
-
-    # Rolling 4-period average
     if len(network) >= 4:
         rolling = network["Shrinkage %"].rolling(4, min_periods=4).mean()
         fig.add_trace(go.Scatter(
@@ -600,13 +608,11 @@ def build_network_trend(trend_data):
             line=dict(dash="dash", width=1, color=COLOR_PRIMARY),
             opacity=0.5, showlegend=True,
         ))
-
     fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-
+    apply_period_labels(fig, network["period_id"])
     fig.update_layout(
         title="Network Shrinkage % Over Time",
-        height=400, xaxis_title="Period", yaxis_title="Shrinkage %",
-        yaxis_tickformat=".2%",
+        height=400, yaxis_tickformat=".2%",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
     )
@@ -617,13 +623,9 @@ def build_store_trend(trend_data):
     """Per-store shrinkage % over time."""
     if trend_data.empty:
         return
-
-    data = trend_data.dropna(subset=["Shrinkage %"])
+    data = trend_data.dropna(subset=["Shrinkage %"]).copy()
     if data.empty:
         return
-
-    # Sort stores consistently
-    data = data.copy()
     data["_sort"] = data["Store"].map(store_sort_key)
     data = data.sort_values(["_sort", "period_id"])
 
@@ -632,9 +634,8 @@ def build_store_trend(trend_data):
         markers=True,
         labels={"period_id": "Period", "Shrinkage %": "Shrinkage %"},
     )
-
     fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-
+    apply_period_labels(fig, data["period_id"])
     fig.update_layout(
         title="Shrinkage % by Store",
         height=500, yaxis_tickformat=".2%",
@@ -648,13 +649,12 @@ def build_reason_composition(reason_trend):
     """Stacked area chart showing adjustment COGS by reason group over time."""
     if reason_trend.empty:
         return
-
     fig = px.area(
         reason_trend, x="period_id", y="Net_Adjustment", color="Reason Group",
         color_discrete_map=GROUP_COLORS,
         labels={"period_id": "Period", "Net_Adjustment": "Adjustment COGS ($)"},
     )
-
+    apply_period_labels(fig, reason_trend["period_id"])
     fig.update_layout(
         title="Adjustment COGS by Reason Group",
         height=400,
@@ -755,7 +755,7 @@ def download_buttons(df, label, key_prefix):
 # ============================================================================
 
 
-def render_group_table(recon_df, sales_by_store, reasons, group_name, description, key):
+def render_group_table(recon_df, sales_by_store, reasons, group_name, key):
     """Render a store-level adjustment table for a reason group."""
     store_agg, _, _ = aggregate_adjustments(recon_df, reasons)
     if store_agg.empty:
@@ -767,8 +767,8 @@ def render_group_table(recon_df, sales_by_store, reasons, group_name, descriptio
         merged = merged.sort_values("_s").drop(columns="_s")
     net = merged["Net_Adjustment"].sum()
     count = int(merged["Adjustments"].sum())
-    st.markdown(f"**{group_name}** -- {description}")
-    st.metric(f"Total {group_name}", f"${net:,.2f} ({count} adjustments)")
+    st.subheader(group_name)
+    st.metric(f"Network Total", f"${net:,.2f} ({count} adjustments)")
     cols = ["Store", "Adjustments", "Net_Adjustment", "Store Sales COGS", "Shrinkage %"]
     avail = [c for c in cols if c in merged.columns]
     fmt = {"Net_Adjustment": "${:,.2f}", "Store Sales COGS": "${:,.2f}", "Shrinkage %": "{:.2%}"}
@@ -777,6 +777,14 @@ def render_group_table(recon_df, sales_by_store, reasons, group_name, descriptio
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
     download_buttons(merged[avail], f"{group_name.lower()}_by_store", key)
+
+
+def compute_group_total(recon_df, reasons):
+    """Quick sum of COGS for a reason group. Returns (net, count)."""
+    filtered = recon_df[recon_df["Reason"].isin(reasons)] if not recon_df.empty else recon_df
+    if filtered.empty:
+        return 0, 0
+    return filtered["COGS"].sum(), len(filtered)
 
 
 def main():
@@ -956,38 +964,31 @@ def main():
     sel_label = period_label(selected_period, period_key) if selected_period else "All Data"
     st.markdown(f"### {sel_label}")
 
-    # Shrinkage headline metrics
+    # Compute all group totals for headlines
     shrinkage_reasons = get_reasons_for_report("Shrinkage")
     shrink_store, _, _ = aggregate_adjustments(period_recon, shrinkage_reasons)
     shrink_merged = merge_with_sales(shrink_store, sales_by_store, on_cols=["Store"])
 
-    if not shrink_merged.empty:
-        net_adj = shrink_merged["Net_Adjustment"].sum()
-        net_cogs = shrink_merged.get("Store Sales COGS", pd.Series([0])).sum()
-        net_pct = net_adj / net_cogs if net_cogs != 0 else None
+    shrink_net, shrink_count = compute_group_total(period_recon, REASON_GROUPS["Shrinkage"])
+    samples_net, _ = compute_group_total(period_recon, REASON_GROUPS["Samples"])
+    display_net, _ = compute_group_total(period_recon, REASON_GROUPS["Display"])
+    damaged_net, _ = compute_group_total(period_recon, REASON_GROUPS["Damaged"])
+    expired_net, _ = compute_group_total(period_recon, REASON_GROUPS["Expired"])
+    other_net, _ = compute_group_total(period_recon, REASON_GROUPS["Other"])
 
-        # Previous period delta
-        delta_str = None
-        if not prev_recon.empty and not prev_sales.empty:
-            prev_sales_store = prev_sales.groupby("Store", as_index=False)["Sales COGS"].sum().rename(
-                columns={"Sales COGS": "Store Sales COGS"}
-            )
-            prev_shrink, _, _ = aggregate_adjustments(prev_recon, shrinkage_reasons)
-            prev_merged = merge_with_sales(prev_shrink, prev_sales_store, on_cols=["Store"])
-            if not prev_merged.empty:
-                prev_adj = prev_merged["Net_Adjustment"].sum()
-                prev_cogs = prev_merged.get("Store Sales COGS", pd.Series([0])).sum()
-                prev_pct = prev_adj / prev_cogs if prev_cogs != 0 else None
-                if prev_pct is not None and net_pct is not None:
-                    delta_str = f"{(net_pct - prev_pct):.2%} vs prior"
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Shrinkage (Net)", format_currency(net_adj), delta=delta_str, delta_color="inverse")
-        with col2:
-            st.metric("Sales COGS", format_currency(net_cogs))
-        with col3:
-            st.metric("Shrinkage Rate", format_pct(net_pct))
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    with col1:
+        st.metric("Shrinkage", format_currency(shrink_net))
+    with col2:
+        st.metric("Samples", format_currency(samples_net))
+    with col3:
+        st.metric("Display", format_currency(display_net))
+    with col4:
+        st.metric("Damaged", format_currency(damaged_net))
+    with col5:
+        st.metric("Expired", format_currency(expired_net))
+    with col6:
+        st.metric("Other", format_currency(other_net))
 
     # ----------------------------------------------------------------
     # Tabs
@@ -1016,12 +1017,6 @@ def main():
 
     # == Tab 2: Shrinkage by Location ==
     with tab2:
-        st.markdown(
-            "**Shrinkage** measures unexplained inventory variances: "
-            "items that appear (**oversold**, positive) or go missing "
-            "(**undersold**, negative) with no documented cause. "
-            "This excludes known adjustments like samples, display waste, and damaged goods."
-        )
         if shrink_merged.empty:
             st.info("No shrinkage data for this period.")
         else:
@@ -1086,82 +1081,62 @@ def main():
                 styled = styled.map(color_rate, subset=["Rate"])
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
-            # Insights: notable store changes vs prior period
-            if not prev_recon.empty and not prev_sales.empty:
-                prev_sales_store = prev_sales.groupby("Store", as_index=False)["Sales COGS"].sum().rename(
-                    columns={"Sales COGS": "Store Sales COGS"}
-                )
-                prev_shrink, _, _ = aggregate_adjustments(prev_recon, shrinkage_reasons)
-                prev_merged = merge_with_sales(prev_shrink, prev_sales_store, on_cols=["Store"])
-                if not prev_merged.empty:
-                    comp = shrink_merged.merge(
-                        prev_merged[["Store", "Net_Adjustment"]],
-                        on="Store", suffixes=("", "_prev"), how="inner",
-                    )
-                    comp["change"] = comp["Net_Adjustment"] - comp["Net_Adjustment_prev"]
-                    notable = comp[comp["change"].abs() > 50].sort_values("change")
-                    if not notable.empty:
-                        prev_label = period_label(prev_period, period_key)
-                        st.markdown(f"**Notable changes vs {prev_label}:**")
-                        for _, r in notable.iterrows():
-                            direction = "increased" if r["change"] < 0 else "improved"
-                            st.markdown(
-                                f"- **{r['Store']}**: shrinkage {direction} by "
-                                f"${abs(r['change']):,.2f} "
-                                f"(was ${r['Net_Adjustment_prev']:,.2f}, now ${r['Net_Adjustment']:,.2f})"
-                            )
-
             download_buttons(display_with_total, "shrinkage_by_location", "shrink")
 
     # == Tab 3: Adjustments ==
     with tab3:
-        st.markdown(
-            "Inventory adjustments grouped by cause. These are **not shrinkage** "
-            "but expected business operations like samples given out, display waste, "
-            "damaged goods, expired products, and returns."
-        )
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Samples"], "Samples", "samp")
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Display"], "Display", "disp")
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Damaged"], "Damaged", "dmg")
+        st.markdown("---")
+        render_group_table(period_recon, sales_by_store, REASON_GROUPS["Expired"], "Expired", "exp")
+        st.markdown("---")
 
-        render_group_table(
-            period_recon, sales_by_store,
-            REASON_GROUPS["Samples"], "Samples",
-            "Product given as samples (team meetings, promos, vendor samples).",
-            "samp",
-        )
-        st.markdown("---")
-        render_group_table(
-            period_recon, sales_by_store,
-            REASON_GROUPS["Display"], "Display Waste",
-            "Display floor items disposed per Haven Waste SOP.",
-            "disp",
-        )
-        st.markdown("---")
-        render_group_table(
-            period_recon, sales_by_store,
-            REASON_GROUPS["Damaged"], "Damaged",
-            "Products damaged in-store (broken jars, defective units).",
-            "dmg",
-        )
-        st.markdown("---")
-        render_group_table(
-            period_recon, sales_by_store,
-            REASON_GROUPS["Expired"], "Expired",
-            "Products pulled due to expiration.",
-            "exp",
-        )
-        st.markdown("---")
-        render_group_table(
-            period_recon, sales_by_store,
-            REASON_GROUPS["Other"], "Other",
-            "Returns, waste disposal, audit corrections, and quantity fixes.",
-            "oth",
-        )
+        # Other: headline + detail breakdown by individual reason
+        st.subheader("Other")
+        other_net, other_count = compute_group_total(period_recon, REASON_GROUPS["Other"])
+        st.metric("Network Total", f"${other_net:,.2f} ({other_count} adjustments)")
+
+        other_filtered = period_recon[period_recon["Reason"].isin(REASON_GROUPS["Other"])]
+        if not other_filtered.empty:
+            # Breakdown by individual reason across network
+            reason_breakdown = (
+                other_filtered.groupby("Reason")
+                .agg(Adjustments=("COGS", "count"), Total=("COGS", "sum"))
+                .sort_values("Total")
+                .reset_index()
+            )
+            st.markdown("**By reason:**")
+            fmt_rb = {"Total": "${:,.2f}"}
+            st.dataframe(
+                reason_breakdown.style.format(fmt_rb, na_rep="N/A"),
+                use_container_width=True, hide_index=True,
+            )
+
+            # By store
+            st.markdown("**By store:**")
+            other_by_store = (
+                other_filtered.groupby("Store")
+                .agg(Adjustments=("COGS", "count"), Net_Adjustment=("COGS", "sum"))
+                .reset_index()
+            )
+            other_by_store = merge_with_sales(other_by_store, sales_by_store, on_cols=["Store"])
+            if not other_by_store.empty:
+                other_by_store["_s"] = other_by_store["Store"].map(store_sort_key)
+                other_by_store = other_by_store.sort_values("_s").drop(columns="_s")
+            cols = ["Store", "Adjustments", "Net_Adjustment", "Store Sales COGS", "Shrinkage %"]
+            avail = [c for c in cols if c in other_by_store.columns]
+            fmt_o = {"Net_Adjustment": "${:,.2f}", "Store Sales COGS": "${:,.2f}", "Shrinkage %": "{:.2%}"}
+            st.dataframe(
+                other_by_store[avail].style.format({k: v for k, v in fmt_o.items() if k in avail}, na_rep="N/A"),
+                use_container_width=True, hide_index=True,
+            )
+            download_buttons(other_by_store[avail], "other_by_store", "oth")
 
     # == Tab 4: Employees ==
     with tab4:
-        st.markdown(
-            "Employee-level shrinkage adjustments (oversold + undersold only). "
-            "High adjustment counts or values may indicate training needs or process gaps."
-        )
         _, _, emp_detail = aggregate_adjustments(period_recon, shrinkage_reasons)
         if emp_detail.empty:
             st.info("No employee shrinkage data for this period.")
@@ -1193,7 +1168,6 @@ def main():
 
     # == Tab 5: Raw Data ==
     with tab5:
-        st.markdown("All inventory adjustment rows for the selected period. Use filters to drill down.")
         raw = period_recon.copy()
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
