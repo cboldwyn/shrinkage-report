@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -96,16 +96,18 @@ ALL_REASONS = [
 # "Not Billed" = costs Haven bears. "Billed" = recovered from vendor.
 REASON_GROUPS = {
     # Not Billed (Haven's cost)
-    "Shrinkage":  ["OVERSOLD", "UNDERSOLD", "INCORRECT_QUANTITY", "AUDIT"],
-    "Samples":    ["SAMPLES"],
-    "Other":      ["OTHER"],
+    "Shrinkage":      ["OVERSOLD", "UNDERSOLD"],
+    "Incorrect Qty":  ["INCORRECT_QUANTITY"],
+    "Audit":          ["AUDIT"],
+    "Samples":        ["SAMPLES"],
+    "Other":          ["OTHER"],
     # Billed to Vendor
-    "DDE":        ["WASTE_DISPLAY", "DISPLAY_SAMPLE", "WASTE_RETURN", "DAMAGED",
-                   "WASTE_DISPOSAL", "WASTE_EXPIRED"],
-    "Recall":     ["PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR"],
+    "DDE":            ["WASTE_DISPLAY", "DISPLAY_SAMPLE", "WASTE_RETURN", "DAMAGED",
+                       "WASTE_DISPOSAL", "WASTE_EXPIRED"],
+    "Recall":         ["PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR"],
 }
 
-NOT_BILLED_GROUPS = ["Shrinkage", "Samples", "Other"]
+NOT_BILLED_GROUPS = ["Shrinkage", "Incorrect Qty", "Audit", "Samples", "Other"]
 BILLED_GROUPS = ["DDE", "Recall"]
 
 # DDE sub-groups for detail breakdown
@@ -1182,7 +1184,7 @@ def main():
 
     # == Tab 4: Incorrect Quantity ==
     with tab4:
-        iq_reasons = ["INCORRECT_QUANTITY"]
+        iq_reasons = REASON_GROUPS["Incorrect Qty"]
         iq_filtered = period_recon[period_recon["Reason"].isin(iq_reasons)] if not period_recon.empty else period_recon
 
         if iq_filtered.empty:
