@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -1033,9 +1033,10 @@ def main():
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📈 Trends",
         "📊 Shrinkage by Location",
+        "📋 Legacy Shrink",
         "📦 Adjustments",
         "🔢 Incorrect Quantity",
         "👤 Employees",
@@ -1144,8 +1145,88 @@ def main():
                     use_container_width=True, hide_index=True,
                 )
 
-    # == Tab 3: Adjustments ==
+    # == Tab 3: Legacy Shrink ==
     with tab3:
+        st.caption(
+            "Replicates Georgina's weekly shrinkage report: OVERSOLD + UNDERSOLD by store and category."
+        )
+
+        # Sales by store+category for this period
+        if "Category" in period_sales.columns:
+            legacy_sales = period_sales.groupby(
+                ["Store", "Category"], as_index=False
+            )["Sales COGS"].sum()
+        elif "Product Category" in period_sales.columns:
+            legacy_sales = (
+                period_sales.groupby(["Store", "Product Category"], as_index=False)
+                ["Sales COGS"].sum()
+                .rename(columns={"Product Category": "Category"})
+            )
+        else:
+            legacy_sales = pd.DataFrame()
+
+        legacy_reasons = ["OVERSOLD", "UNDERSOLD"]
+        legacy_recon = period_recon[period_recon["Reason"].isin(legacy_reasons)] if not period_recon.empty else pd.DataFrame()
+
+        if legacy_recon.empty:
+            st.info("No shrinkage data for this period.")
+        else:
+            # Store + Category detail (the pivot table view)
+            legacy_cat = (
+                legacy_recon.groupby(["Store", "Category Name"])
+                .agg(TRUE_AUDIT_COST=("COGS", "sum"))
+                .reset_index()
+                .rename(columns={"Category Name": "Category"})
+            )
+
+            if not legacy_sales.empty:
+                legacy_cat = legacy_cat.merge(legacy_sales, on=["Store", "Category"], how="left")
+                legacy_cat.rename(columns={"Sales COGS": "COGS"}, inplace=True)
+                legacy_cat["%"] = legacy_cat.apply(
+                    lambda r: r["TRUE_AUDIT_COST"] / r["COGS"]
+                    if pd.notna(r.get("COGS")) and r.get("COGS", 0) != 0 else None,
+                    axis=1,
+                )
+
+            # Sort by store then category
+            legacy_cat["_s"] = legacy_cat["Store"].map(store_sort_key)
+            legacy_cat = legacy_cat.sort_values(["_s", "Category"]).drop(columns="_s")
+
+            # Store filter
+            legacy_stores = sorted(legacy_cat["Store"].unique(), key=store_sort_key)
+            selected_legacy = st.multiselect(
+                "Filter by location:",
+                options=legacy_stores, default=legacy_stores,
+                key="legacy_store_filter",
+            )
+            legacy_display = legacy_cat[legacy_cat["Store"].isin(selected_legacy)].copy()
+
+            # Format
+            display_cols = ["Store", "Category", "TRUE AUDIT COST", "COGS", "%"]
+            legacy_display = legacy_display.rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"})
+            avail = [c for c in display_cols if c in legacy_display.columns]
+
+            def color_pct(val):
+                if pd.isna(val):
+                    return ""
+                if abs(val) > 0.05:
+                    return "background-color: #ffcccc"
+                if abs(val) > 0.02:
+                    return "background-color: #fff3cd"
+                return ""
+
+            fmt = {"TRUE AUDIT COST": "${:,.2f}", "COGS": "${:,.2f}", "%": "{:.2%}"}
+            styled = legacy_display[avail].style.format(
+                {k: v for k, v in fmt.items() if k in avail}, na_rep="N/A"
+            )
+            if "%" in avail:
+                styled = styled.map(color_pct, subset=["%"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.caption(f"{len(legacy_display)} rows")
+            download_buttons(legacy_display[avail], "legacy_shrink", "legacy")
+
+    # == Tab 4: Adjustments ==
+    with tab4:
         # DDE (Display, Defective, Expired) - billed to vendor
         st.subheader("DDE (Display, Defective, Expired)")
         dde_net, dde_count = compute_group_total(period_recon, REASON_GROUPS["DDE"])
@@ -1182,8 +1263,8 @@ def main():
             avail_nr = [c for c in nr_cols if c in no_reason.columns]
             st.dataframe(no_reason[avail_nr], use_container_width=True, hide_index=True)
 
-    # == Tab 4: Incorrect Quantity ==
-    with tab4:
+    # == Tab 5: Incorrect Quantity ==
+    with tab5:
         iq_reasons = REASON_GROUPS["Incorrect Qty"]
         iq_filtered = period_recon[period_recon["Reason"].isin(iq_reasons)] if not period_recon.empty else period_recon
 
@@ -1230,8 +1311,8 @@ def main():
             st.caption(f"{len(iq_detail)} adjustments")
             download_buttons(iq_detail, "incorrect_quantity_detail", "iq")
 
-    # == Tab 5: Employees ==
-    with tab5:
+    # == Tab 6: Employees ==
+    with tab6:
         _, _, emp_detail = aggregate_adjustments(period_recon, shrinkage_reasons)
         if emp_detail.empty:
             st.info("No employee shrinkage data for this period.")
@@ -1261,8 +1342,8 @@ def main():
             st.caption(f"{len(filtered_emp)} employees")
             download_buttons(filtered_emp[avail], "employee_shrinkage", "emp")
 
-    # == Tab 6: Raw Data ==
-    with tab6:
+    # == Tab 7: Raw Data ==
+    with tab7:
         raw = period_recon.copy()
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
