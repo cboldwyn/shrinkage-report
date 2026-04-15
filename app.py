@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -1190,9 +1190,9 @@ def main():
             # Store-level totals for sales COGS
             legacy_store_cogs = legacy_sales.groupby("Store", as_index=False)["Sales COGS"].sum() if not legacy_sales.empty else pd.DataFrame()
 
-            # Network summary
+            # Network summary (use ALL sales COGS, not just categories with adjustments)
             net_tac = legacy_cat["TRUE_AUDIT_COST"].sum()
-            net_cogs = legacy_cat["COGS"].sum() if "COGS" in legacy_cat.columns else 0
+            net_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
             net_pct = net_tac / net_cogs if net_cogs != 0 else None
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1208,11 +1208,12 @@ def main():
             for store in sorted(legacy_cat["Store"].unique(), key=store_sort_key):
                 store_data = legacy_cat[legacy_cat["Store"] == store].copy()
                 store_tac = store_data["TRUE_AUDIT_COST"].sum()
-                store_cogs = store_data["COGS"].sum() if "COGS" in store_data.columns else 0
-                store_pct = store_tac / store_cogs if store_cogs != 0 else None
+                # Use full store COGS (all categories), not just categories with adjustments
+                store_full_cogs = sales_by_store[sales_by_store["Store"] == store]["Store Sales COGS"].sum() if not sales_by_store.empty else 0
+                store_pct = store_tac / store_full_cogs if store_full_cogs != 0 else None
                 pct_str = f"{store_pct:.2%}" if store_pct is not None else "N/A"
 
-                with st.expander(f"**{store}**  |  TRUE AUDIT COST: ${store_tac:,.2f}  |  COGS: ${store_cogs:,.2f}  |  {pct_str}"):
+                with st.expander(f"**{store}**  |  TRUE AUDIT COST: ${store_tac:,.2f}  |  COGS: ${store_full_cogs:,.2f}  |  {pct_str}"):
                     cat_display = store_data[["Category", "TRUE_AUDIT_COST", "COGS", "%"]].copy() if "%" in store_data.columns else store_data[["Category", "TRUE_AUDIT_COST"]].copy()
                     cat_display = cat_display.rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"})
                     cat_display = cat_display.sort_values("TRUE AUDIT COST")
