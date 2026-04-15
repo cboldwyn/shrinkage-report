@@ -41,7 +41,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -1148,7 +1148,7 @@ def main():
     # == Tab 3: Legacy Shrink ==
     with tab3:
         st.caption(
-            "Replicates Georgina's weekly shrinkage report: OVERSOLD + UNDERSOLD by store and category."
+            "OVERSOLD + UNDERSOLD by store and category. Matches Georgina's weekly shrinkage report."
         )
 
         # Sales by store+category for this period
@@ -1171,14 +1171,13 @@ def main():
         if legacy_recon.empty:
             st.info("No shrinkage data for this period.")
         else:
-            # Store + Category detail (the pivot table view)
+            # Store + Category detail
             legacy_cat = (
                 legacy_recon.groupby(["Store", "Category Name"])
                 .agg(TRUE_AUDIT_COST=("COGS", "sum"))
                 .reset_index()
                 .rename(columns={"Category Name": "Category"})
             )
-
             if not legacy_sales.empty:
                 legacy_cat = legacy_cat.merge(legacy_sales, on=["Store", "Category"], how="left")
                 legacy_cat.rename(columns={"Sales COGS": "COGS"}, inplace=True)
@@ -1188,42 +1187,46 @@ def main():
                     axis=1,
                 )
 
-            # Sort by store then category
-            legacy_cat["_s"] = legacy_cat["Store"].map(store_sort_key)
-            legacy_cat = legacy_cat.sort_values(["_s", "Category"]).drop(columns="_s")
+            # Store-level totals for sales COGS
+            legacy_store_cogs = legacy_sales.groupby("Store", as_index=False)["Sales COGS"].sum() if not legacy_sales.empty else pd.DataFrame()
 
-            # Store filter
-            legacy_stores = sorted(legacy_cat["Store"].unique(), key=store_sort_key)
-            selected_legacy = st.multiselect(
-                "Filter by location:",
-                options=legacy_stores, default=legacy_stores,
-                key="legacy_store_filter",
-            )
-            legacy_display = legacy_cat[legacy_cat["Store"].isin(selected_legacy)].copy()
+            # Network summary
+            net_tac = legacy_cat["TRUE_AUDIT_COST"].sum()
+            net_cogs = legacy_cat["COGS"].sum() if "COGS" in legacy_cat.columns else 0
+            net_pct = net_tac / net_cogs if net_cogs != 0 else None
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Network TRUE AUDIT COST", format_currency(net_tac))
+            with c2:
+                st.metric("Network COGS", format_currency(net_cogs))
+            with c3:
+                st.metric("Network %", format_pct(net_pct))
 
-            # Format
-            display_cols = ["Store", "Category", "TRUE AUDIT COST", "COGS", "%"]
-            legacy_display = legacy_display.rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"})
-            avail = [c for c in display_cols if c in legacy_display.columns]
-
-            def color_pct(val):
-                if pd.isna(val):
-                    return ""
-                if abs(val) > 0.05:
-                    return "background-color: #ffcccc"
-                if abs(val) > 0.02:
-                    return "background-color: #fff3cd"
-                return ""
-
+            # Nested: one expander per store with subtotal + category table
             fmt = {"TRUE AUDIT COST": "${:,.2f}", "COGS": "${:,.2f}", "%": "{:.2%}"}
-            styled = legacy_display[avail].style.format(
-                {k: v for k, v in fmt.items() if k in avail}, na_rep="N/A"
-            )
-            if "%" in avail:
-                styled = styled.map(color_pct, subset=["%"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-            st.caption(f"{len(legacy_display)} rows")
-            download_buttons(legacy_display[avail], "legacy_shrink", "legacy")
+
+            for store in sorted(legacy_cat["Store"].unique(), key=store_sort_key):
+                store_data = legacy_cat[legacy_cat["Store"] == store].copy()
+                store_tac = store_data["TRUE_AUDIT_COST"].sum()
+                store_cogs = store_data["COGS"].sum() if "COGS" in store_data.columns else 0
+                store_pct = store_tac / store_cogs if store_cogs != 0 else None
+                pct_str = f"{store_pct:.2%}" if store_pct is not None else "N/A"
+
+                with st.expander(f"**{store}**  |  TRUE AUDIT COST: ${store_tac:,.2f}  |  COGS: ${store_cogs:,.2f}  |  {pct_str}"):
+                    cat_display = store_data[["Category", "TRUE_AUDIT_COST", "COGS", "%"]].copy() if "%" in store_data.columns else store_data[["Category", "TRUE_AUDIT_COST"]].copy()
+                    cat_display = cat_display.rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"})
+                    cat_display = cat_display.sort_values("TRUE AUDIT COST")
+
+                    avail = [c for c in ["Category", "TRUE AUDIT COST", "COGS", "%"] if c in cat_display.columns]
+                    styled = cat_display[avail].style.format(
+                        {k: v for k, v in fmt.items() if k in avail}, na_rep="N/A"
+                    )
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # Full download
+            full_download = legacy_cat.rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"}).copy()
+            full_cols = [c for c in ["Store", "Category", "TRUE AUDIT COST", "COGS", "%"] if c in full_download.columns]
+            download_buttons(full_download[full_cols], "legacy_shrink", "legacy")
 
     # == Tab 4: Adjustments ==
     with tab4:
