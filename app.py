@@ -11,11 +11,25 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.6 (2026-05-25)
+- Reason Code Audit tab restructured. Long-format table + Min |COGS|
+  filter removed. Cross-tab now supports multi-row + multi-column
+  selection (cmd/shift-click) and feeds a transaction viewer below.
+  Viewer scope is the union of selected (Shop, Category) rows AND
+  selected Reason columns; selecting only rows scopes to all reasons
+  for those scopes, selecting only columns scopes to all stores+cats
+  for those reasons.
+- Em-dash purge across the entire file (comments, docstrings, strings,
+  zero-cell renderers, na_rep). Project voice rule now applies
+  everywhere in the codebase.
+- Date Timestamp fallback moved up to the all_recon load layer, so
+  both the Reason Code Audit tab and the Per-Store Homework tab see
+  the date column consistently.
 v2.6.5 (2026-05-25)
 - Drill table: fake select-all visual ✓ removed. Streamlit's st.dataframe
   multi-row checkboxes are user-click-only (no programmatic API), so we
   don't fake them. The Select-all-visible checkbox below the count line
-  still switches the Add button to "Add all visible" — that's the
+  still switches the Add button to "Add all visible". that's the
   workaround for bulk-add until Streamlit ships programmatic selection.
 - Column display: "Date Timestamp" renamed to "Date" across drill / cart
   / homework export via DRILL_DISPLAY_LABELS. Underlying CSV column name
@@ -95,7 +109,7 @@ v2.6.0 (2026-05-14)
   in cells; DNU columns first and colored red) AND a long-format
   sortable/filterable list (Compliance | Shop | Category | Reason |
   Adjustments | SUM of COGS) below. Filters: Store, Compliance status,
-  Min |COGS|. Read-only — no transaction drill on this tab.
+  Min |COGS|. Read-only. no transaction drill on this tab.
 - New tab: 📝 Per-Store Homework. Replicates Lisa's per-store workbook flow
   end-to-end: pick a store → see her Shrinkage summary (per-Category
   OVERSOLD/UNDERSOLD/TAC/COGS/% + Store Total row) → see Pivot Table 3
@@ -148,9 +162,9 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.5"
+VERSION = "2.6.6"
 
-# Email of the human owner of this app — used to auto-share newly-created
+# Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
 USER_EMAIL = "charles@myhavenstores.com"
 
@@ -197,7 +211,7 @@ RECON_STORE_COLS = [
 ]
 SALES_REQUIRED_COLS = ["Date", "Shop", "Product Category", "COGS"]
 
-# Lisa's drill-down column subset. Keep order — Lisa scans left to right.
+# Lisa's drill-down column subset. Keep order. Lisa scans left to right.
 # Order locked 5/19 PM (DC/Retail Touch Base): the things she needs first are on the left;
 # Batch / Metrc Adjustment / Cost per Unit pushed right of Difference/COGS/Reason/Reason Note.
 LISA_DRILL_COLS = [
@@ -206,7 +220,7 @@ LISA_DRILL_COLS = [
     "Batch SKU", "Metrc Adjustment", "Cost per Unit",
 ]
 
-# Display labels — keep underlying CSV column names, only rename for display.
+# Display labels. keep underlying CSV column names, only rename for display.
 # - "Batch SKU" → "Blaze Batch": the column is the per-batch UID Lisa works
 #   with; the CSV label is ambiguous.
 # - "Date Timestamp" → "Date": the underlying CSV column is named
@@ -216,7 +230,7 @@ DRILL_DISPLAY_LABELS = {
     "Date Timestamp": "Date",
 }
 
-# Display labels for reason codes — shortens to fit the combined Per-Store
+# Display labels for reason codes. shortens to fit the combined Per-Store
 # Adjustment Breakdown table without wrapping. Underlying constants and CSV
 # values are untouched (filters / classification all still key on the raw code).
 REASON_DISPLAY_LABELS = {
@@ -453,7 +467,7 @@ def _service_account_email():
 def make_homework_gsheet(sheets_dict, title, share_with=None, folder_id=None):
     """Upload the homework workbook to a new Google Sheet and return the URL.
 
-    sheets_dict: {sheet_name: DataFrame} — same shape as the xlsx writer.
+    sheets_dict: {sheet_name: DataFrame}. same shape as the xlsx writer.
     title: Sheet title (will get a timestamp suffix).
     share_with: list of email addresses to grant writer access to (notify=False).
     folder_id: Drive folder ID to create the sheet inside. Folder must be
@@ -1271,6 +1285,11 @@ def main():
         all_recon["_date"] = pd.to_datetime(all_recon["Date"], format="mixed", errors="coerce")
     if "Store" not in all_recon.columns:
         all_recon["Store"] = all_recon["Shop"].map(short_store_name)
+    # Date Timestamp fallback: pre-v2.6.0 uploads only have "Date". Alias once
+    # at the top so every downstream tab (Reason Code Audit, Per-Store Homework,
+    # cart, export) sees a consistent column.
+    if "Date Timestamp" not in all_recon.columns and "Date" in all_recon.columns:
+        all_recon["Date Timestamp"] = all_recon["Date"]
 
     # ----------------------------------------------------------------
     # Filter to selected period
@@ -1418,7 +1437,7 @@ def main():
             }
             display_df = display_df.rename(columns={k: v for k, v in col_rename.items() if k in display_df.columns})
 
-            # Grand total — use full network COGS across all stores (not just stores with
+            # Grand total. use full network COGS across all stores (not just stores with
             # shrinkage in display_df) to keep zero-shrink stores in the denominator.
             full_network_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
             totals = {"Store": "NETWORK TOTAL"}
@@ -1483,16 +1502,16 @@ def main():
     with tab_compliance:
         st.caption(
             "Network-wide reason-code compliance and dollar-amount audit. Matches the "
-            "`Pivot Table2` layout in Lisa's monthly template — Shop × Category in rows, "
-            "Reason in columns, SUM of COGS in cells. **Click a row + column on the "
-            "cross-tab to drill into the underlying transactions** (or use the sortable "
-            "long-format below)."
+            "`Pivot Table2` layout in Lisa's monthly template (Shop × Category in rows, "
+            "Reason in columns, SUM of COGS in cells). Click rows and columns on the "
+            "cross-tab to scope the transaction viewer below. Multi-select with "
+            "cmd/shift-click to drill across multiple cells at once."
         )
 
         if period_recon.empty:
             st.info("No reconciliation data for this period.")
         else:
-            fc1, fc2, fc3 = st.columns(3)
+            fc1, fc2 = st.columns(2)
             with fc1:
                 ca_stores = st.multiselect(
                     "Store",
@@ -1504,12 +1523,6 @@ def main():
                     "Compliance",
                     options=["✅ Approved", "🚫 DNU", "⚠️ Unknown"],
                     key="ca_compliance",
-                )
-            with fc3:
-                ca_min_cogs = st.number_input(
-                    "Min |COGS| (long-format only)",
-                    min_value=0.0, value=0.0, step=10.0,
-                    key="ca_min_cogs",
                 )
 
             ca_scope = period_recon.copy()
@@ -1550,9 +1563,8 @@ def main():
             if rollup.empty:
                 st.info("No rows match the current filters.")
             else:
-                # Cross-tab (top)
                 st.markdown("---")
-                st.markdown("**Cross-tab — Shop × Category in rows, Reason in columns, SUM of COGS in cells.**")
+                st.markdown("**Cross-tab.** Shop × Category in rows, Reason in columns, SUM of COGS in cells.")
 
                 xt = pd.pivot_table(
                     rollup,
@@ -1577,7 +1589,7 @@ def main():
 
                 def _fmt_cell(v):
                     if pd.isna(v) or float(v) == 0.0:
-                        return "—"
+                        return ""
                     return f"${v:,.2f}"
 
                 def _style_xt(df):
@@ -1587,9 +1599,7 @@ def main():
                         zero = ~nonzero
                         is_dnu = c in dnu_col_labels
                         is_unk = c not in dnu_col_labels and not c.startswith("✅ ")
-                        # Zero cells: muted dash
                         styles.loc[zero, c] = "color: #cccccc; text-align: right;"
-                        # Non-zero in DNU column: pop red
                         if is_dnu:
                             styles.loc[nonzero, c] = "background-color: #ffcccc; color: #800000; font-weight: 700; text-align: right;"
                         elif is_unk:
@@ -1599,17 +1609,17 @@ def main():
                     return styles
 
                 fmt_xt = {c: _fmt_cell for c in xt_display.columns}
-                xt_styled = xt_display.style.format(fmt_xt, na_rep="—").apply(_style_xt, axis=None)
+                xt_styled = xt_display.style.format(fmt_xt, na_rep="").apply(_style_xt, axis=None)
 
-                # Drill from the cross-tab: click a (Store, Category) row + a Reason column
-                # to open the transactions panel below. Single click on each axis = scope.
-                # Click again on the same row/column to deselect.
+                # Multi-select cross-tab: cmd/shift-click rows and columns to
+                # extend selection. The transaction viewer below pulls the union
+                # of (selected Shop+Category) and (selected Reason) scopes.
                 xt_event = st.dataframe(
                     xt_styled,
                     use_container_width=True,
                     height=440,
                     on_select="rerun",
-                    selection_mode=["single-row", "single-column"],
+                    selection_mode=["multi-row", "multi-column"],
                     key="ca_xt_event",
                 )
 
@@ -1619,90 +1629,81 @@ def main():
                     xt_sel_rows = list(getattr(xt_event.selection, "rows", []) or [])
                     xt_sel_cols = list(getattr(xt_event.selection, "columns", []) or [])
 
-                xt_picked_shop = None
-                xt_picked_cat = None
-                xt_picked_reason = None
-                if xt_sel_rows:
-                    idx_label = xt.index[xt_sel_rows[0]]
-                    if isinstance(idx_label, tuple) and len(idx_label) == 2:
-                        xt_picked_shop, xt_picked_cat = idx_label
-                if xt_sel_cols:
-                    col_label = xt_sel_cols[0]
+                # Decode selections into raw Shop+Category tuples and raw Reason codes
+                ca_selected_scopes = []  # list of (Shop, Category) tuples
+                for r_idx in xt_sel_rows:
+                    if 0 <= r_idx < len(xt.index):
+                        idx_label = xt.index[r_idx]
+                        if isinstance(idx_label, tuple) and len(idx_label) == 2:
+                            ca_selected_scopes.append(idx_label)
+
+                ca_selected_reasons = []
+                rev_reason_labels = {v: k for k, v in REASON_DISPLAY_LABELS.items()}
+                for col_label in xt_sel_cols:
+                    raw = col_label
                     for prefix in ("🚫 ", "✅ ", "⚠️ "):
                         if col_label.startswith(prefix):
-                            xt_picked_reason = col_label[len(prefix):]
+                            raw = col_label[len(prefix):]
                             break
-                    else:
-                        xt_picked_reason = col_label
+                    raw = rev_reason_labels.get(raw, raw)
+                    ca_selected_reasons.append(raw)
 
-                # Long-format (below)
+                # Transaction viewer: pull period_recon rows matching the selection.
                 st.markdown("---")
-                st.markdown("**Long-format — same data, sortable + filterable. Sorted by |COGS| descending.**")
+                st.subheader("Transaction viewer")
+                if not ca_selected_scopes and not ca_selected_reasons:
+                    st.info("Click rows or columns on the cross-tab above to populate the transaction viewer. Cmd/shift-click to multi-select.")
+                else:
+                    ca_drill = period_recon.copy()
+                    if ca_selected_scopes:
+                        scope_mask = pd.Series(False, index=ca_drill.index)
+                        for shop, cat in ca_selected_scopes:
+                            scope_mask |= (
+                                (ca_drill["Store"] == shop)
+                                & (ca_drill["Category Name"] == cat)
+                            )
+                        ca_drill = ca_drill[scope_mask]
+                    if ca_selected_reasons:
+                        ca_drill = ca_drill[ca_drill["Reason"].isin(ca_selected_reasons)]
 
-                lf = rollup.copy()
-                lf["_abs"] = lf["TRUE_AUDIT_COST"].abs()
-                if ca_min_cogs > 0:
-                    lf = lf[lf["_abs"] >= ca_min_cogs]
-                lf = lf.sort_values("_abs", ascending=False).drop(columns="_abs")
-                lf_cols = ["Compliance", "Store", "Category", "Reason", "Adjustments", "TRUE_AUDIT_COST"]
-                lf_display = lf[lf_cols].rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"}).reset_index(drop=True)
-
-                def _row_color(row):
-                    if row["Compliance"] == "🚫 DNU":
-                        return ["background-color: #ffcccc"] * len(row)
-                    if row["Compliance"] == "⚠️ Unknown":
-                        return ["background-color: #fff3cd"] * len(row)
-                    return [""] * len(row)
-
-                lf_styled = lf_display.style.format(
-                    {"TRUE AUDIT COST": "${:,.2f}"}
-                ).apply(_row_color, axis=1)
-
-                ca_drill_event = st.dataframe(
-                    lf_styled,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=440,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                    key="ca_lf_drill_event",
-                )
-
-                download_buttons(lf_display, "compliance_audit", "ca_export")
-
-                # ----- Drill panel: view-only transactions for the clicked Shop+Cat+Reason -----
-                # Cross-tab selection takes priority when it fully specifies a cell
-                # (shop + category + reason). Otherwise fall back to long-format row pick.
-                ca_drill_sel = []
-                if ca_drill_event is not None and hasattr(ca_drill_event, "selection"):
-                    ca_drill_sel = list(ca_drill_event.selection.rows or [])
-
-                xt_full_drill = xt_picked_shop and xt_picked_cat and xt_picked_reason
-                ds_shop = ds_cat = ds_rsn = None
-                if xt_full_drill:
-                    ds_shop, ds_cat, ds_rsn = xt_picked_shop, xt_picked_cat, xt_picked_reason
-                elif ca_drill_sel:
-                    sel = lf_display.iloc[ca_drill_sel[0]]
-                    ds_shop, ds_cat, ds_rsn = sel["Store"], sel["Category"], sel["Reason"]
-
-                if ds_shop and ds_cat and ds_rsn:
-                    ca_drill = period_recon[
-                        (period_recon["Store"] == ds_shop)
-                        & (period_recon["Category Name"] == ds_cat)
-                        & (period_recon["Reason"] == ds_rsn)
-                    ].copy()
+                    ca_drill = ca_drill.copy()
                     ca_drill["_abs"] = ca_drill["COGS"].abs()
                     ca_drill = ca_drill.sort_values("_abs", ascending=False).drop(columns="_abs")
+
                     drill_show_cols = [c for c in LISA_DRILL_COLS if c in ca_drill.columns]
-                    st.markdown("---")
+
+                    # Selection summary
+                    scope_parts = []
+                    if ca_selected_scopes:
+                        scope_parts.append(
+                            f"{len(ca_selected_scopes)} scope(s): "
+                            + ", ".join(f"{s} · {c}" for s, c in ca_selected_scopes[:3])
+                            + (f", +{len(ca_selected_scopes) - 3} more" if len(ca_selected_scopes) > 3 else "")
+                        )
+                    if ca_selected_reasons:
+                        scope_parts.append(
+                            f"{len(ca_selected_reasons)} reason(s): "
+                            + ", ".join(ca_selected_reasons[:5])
+                            + (f", +{len(ca_selected_reasons) - 5} more" if len(ca_selected_reasons) > 5 else "")
+                        )
+                    st.caption(" · ".join(scope_parts))
+
                     tac = ca_drill["COGS"].sum()
-                    st.subheader(
-                        f"Drill: **{ds_shop}** · **{ds_cat}** · **{ds_rsn}** — "
-                        f"{len(ca_drill)} txns, ${tac:,.2f}"
+                    st.markdown(
+                        f"**{len(ca_drill):,} transaction(s).** Sum COGS ${tac:,.2f}"
                     )
-                    st.caption("View-only on this tab. Use the Per-Store Homework tab to flag transactions.")
-                    st.dataframe(_apply_drill_labels(ca_drill[drill_show_cols]), use_container_width=True, hide_index=True, height=420)
-                    download_buttons(_apply_drill_labels(ca_drill[drill_show_cols]), f"audit_drill_{ds_shop}_{ds_cat}_{ds_rsn}", "ca_drill_dl")
+                    st.caption("View only on this tab. Use the Per-Store Homework tab to flag transactions for a GM packet.")
+                    st.dataframe(
+                        _apply_drill_labels(ca_drill[drill_show_cols]),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=440,
+                    )
+                    download_buttons(
+                        _apply_drill_labels(ca_drill[drill_show_cols]),
+                        "compliance_drill",
+                        "ca_drill_dl",
+                    )
 
     # == Tab Per-Store Homework ==
     with tab_workbook:
@@ -1967,7 +1968,7 @@ def main():
                 # Sync the drill filters to the cross-tab selection.
                 # Replace (not additive): cross-tab is now the source of truth for scoping.
                 # When the user manually edits the multiselect filters below, those edits
-                # persist between cross-tab interactions — only an actual change to the
+                # persist between cross-tab interactions. only an actual change to the
                 # cross-tab selection overwrites the filter.
                 cat_filter_key = f"lw_drill_cat_filter_{selected_store}"
                 rsn_filter_key = f"lw_drill_reason_filter_{selected_store}"
@@ -2058,7 +2059,7 @@ def main():
                 )
 
                 # ✓ column reflects ONLY cart membership (not select-all). Streamlit's
-                # st.dataframe multi-row selection is user-click-only — there's no API
+                # st.dataframe multi-row selection is user-click-only. there's no API
                 # to programmatically set row-selection state, so we don't fake it.
                 # The Select-all-visible checkbox below controls what the Add button
                 # adds, but row-level checkmarks in the table are user-driven only.
@@ -2287,7 +2288,7 @@ def main():
                                             f"**Service account email** (must be Editor on your folder):  \n"
                                             f"`{sa_email or '(not found in secrets)'}`\n\n"
                                             f"**Folder ID being used:**  \n"
-                                            f"`{folder_id or '(none — secret missing)'}`\n\n"
+                                            f"`{folder_id or '(none, secret missing)'}`\n\n"
                                             f"**Common fixes:**\n"
                                             f"- Verify the secret key is exactly `homework_drive_folder_id` "
                                             f"(top-level, NOT nested under `[google_sheets]`).\n"
@@ -2295,7 +2296,7 @@ def main():
                                             f"email as **Editor** (not Viewer).\n"
                                             f"- If the folder is in a Shared Drive, make sure the service "
                                             f"account is a member of that Shared Drive (Manage members).\n"
-                                            f"- Click 'Reboot app' in Streamlit Cloud after saving secrets — "
+                                            f"- Click 'Reboot app' in Streamlit Cloud after saving secrets; "
                                             f"the secrets file is cached until reboot."
                                         )
                                         if quota_hit and not folder_id:
@@ -2460,7 +2461,7 @@ def main():
             dde_cols = ["Store"] + sub_list + ["DDE Total", "Store Sales COGS", "% of COGS"]
             dde_display = dde_by_store[[c for c in dde_cols if c in dde_by_store.columns]].copy()
 
-            # Grand total row — full network COGS denominator (zero-DDE stores stay in)
+            # Grand total row. full network COGS denominator (zero-DDE stores stay in)
             full_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
             totals = {"Store": "NETWORK TOTAL"}
             for c in dde_display.columns:
