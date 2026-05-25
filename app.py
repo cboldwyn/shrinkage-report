@@ -11,6 +11,18 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.8 (2026-05-25)
+- New Accounting tab (replaces Shrinkage by Location). Per-store table
+  with QuickBooks book-entry line items: Display, Defective, Expired
+  (DDE, billed to vendor), Store Shrinkage (OVERSOLD + UNDERSOLD,
+  Haven's cost), Assumed Receipt (delta to total: everything else
+  including INCORRECT_QUANTITY / AUDIT / SAMPLES / etc), and Total.
+  Network total row at the bottom. CSV / xlsx download.
+- Tab "Adjustments" renamed to "DDE".
+- Tab "Incorrect Quantity" renamed to "Assumed Receipt".
+- Reason code "INCORRECT_QUANTITY" displays as "Assumed Receipt" across
+  Reason Code Audit cross-tab and Per-Store Homework cross-tab.
+- Employees tab dropped.
 v2.6.7 (2026-05-25)
 - Per-Store Homework drill table: cart-membership ✓ column removed. The
   "already in cart" count above the table is the cart-membership signal;
@@ -167,7 +179,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.7"
+VERSION = "2.6.8"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -239,7 +251,7 @@ DRILL_DISPLAY_LABELS = {
 # Adjustment Breakdown table without wrapping. Underlying constants and CSV
 # values are untouched (filters / classification all still key on the raw code).
 REASON_DISPLAY_LABELS = {
-    "INCORRECT_QUANTITY": "INCORRECT_QTY",
+    "INCORRECT_QUANTITY": "Assumed Receipt",
 }
 
 # -- Reason system --
@@ -1386,15 +1398,14 @@ def main():
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
-    tab1, tab2, tab_compliance, tab_workbook, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab_accounting, tab_compliance, tab_workbook, tab3, tab4, tab5, tab7 = st.tabs([
         "📈 Trends",
-        "📊 Shrinkage by Location",
+        "🧾 Accounting",
         "✅ Reason Code Audit",
         "📝 Per-Store Homework",
         "📋 Legacy Shrink",
-        "📦 Adjustments",
-        "🔢 Incorrect Quantity",
-        "👤 Employees",
+        "📦 DDE",
+        "🔢 Assumed Receipt",
         "📄 Raw Data",
     ])
 
@@ -1413,95 +1424,65 @@ def main():
         build_reason_composition(reason_trend)
 
     # == Tab 2: Shrinkage by Location ==
-    with tab2:
+    with tab_accounting:
         st.caption(
-            "Shrinkage = unexplained inventory variances (oversold + undersold). "
-            "Excludes known adjustments like samples, display waste, and damaged goods."
+            "Per-store book entries for the selected period. Each line item is a "
+            "QuickBooks journal: Display, Defective, and Expired bill to vendor; "
+            "Store Shrinkage is OVERSOLD + UNDERSOLD (Haven's cost); Assumed Receipt "
+            "is the delta to total (everything else, including INCORRECT_QUANTITY / "
+            "AUDIT / SAMPLES / other reason codes)."
         )
-        if shrink_merged.empty:
-            st.info("No shrinkage data for this period.")
+        if period_recon.empty:
+            st.info("No reconciliation data for this period.")
         else:
-            if not shrink_merged.empty:
-                shrink_merged["_sort"] = shrink_merged["Store"].map(store_sort_key)
-                shrink_merged = shrink_merged.sort_values("_sort").drop(columns="_sort")
+            display_reasons = DDE_SUBGROUPS["Display"]
+            defective_reasons = DDE_SUBGROUPS["Defective"]
+            expired_reasons = DDE_SUBGROUPS["Expired"]
+            shrinkage_reasons_ac = REASON_GROUPS["Shrinkage"]
 
-            display_cols = [
-                "Store", "Adjustments", "Gains", "Losses",
-                "Net_Adjustment", "Store Sales COGS", "Shrinkage %",
-            ]
-            avail = [c for c in display_cols if c in shrink_merged.columns]
-            display_df = shrink_merged[avail].copy()
+            def _store_bucket_total(store, reasons):
+                mask = (period_recon["Store"] == store) & (period_recon["Reason"].isin(reasons))
+                return float(period_recon.loc[mask, "COGS"].sum())
 
-            # Rename columns for readability
-            col_rename = {
-                "Gains": "Overages ($)",
-                "Losses": "Shortages ($)",
-                "Net_Adjustment": "Net ($)",
-                "Store Sales COGS": "Sales COGS ($)",
-                "Shrinkage %": "Rate",
-            }
-            display_df = display_df.rename(columns={k: v for k, v in col_rename.items() if k in display_df.columns})
+            stores_ac = sorted(period_recon["Store"].dropna().unique(), key=store_sort_key)
+            ac_rows = []
+            for s in stores_ac:
+                store_mask = period_recon["Store"] == s
+                store_total = float(period_recon.loc[store_mask, "COGS"].sum())
+                disp = _store_bucket_total(s, display_reasons)
+                defc = _store_bucket_total(s, defective_reasons)
+                expr = _store_bucket_total(s, expired_reasons)
+                shrk = _store_bucket_total(s, shrinkage_reasons_ac)
+                assumed = store_total - (disp + defc + expr + shrk)
+                ac_rows.append({
+                    "Store": s,
+                    "Display": disp,
+                    "Defective": defc,
+                    "Expired": expr,
+                    "Store Shrinkage": shrk,
+                    "Assumed Receipt": assumed,
+                    "Total": store_total,
+                })
 
-            # Grand total. use full network COGS across all stores (not just stores with
-            # shrinkage in display_df) to keep zero-shrink stores in the denominator.
-            full_network_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
-            totals = {"Store": "NETWORK TOTAL"}
-            for c in display_df.columns:
-                if c == "Store":
-                    continue
-                if c == "Rate":
-                    net = display_df["Net ($)"].sum() if "Net ($)" in display_df.columns else 0
-                    totals[c] = net / full_network_cogs if full_network_cogs != 0 else None
-                elif c == "Sales COGS ($)":
-                    totals[c] = full_network_cogs
-                elif c == "Adjustments":
-                    totals[c] = int(display_df[c].sum())
-                else:
-                    totals[c] = display_df[c].sum()
+            ac_df = pd.DataFrame(ac_rows)
 
-            display_with_total = pd.concat([display_df, pd.DataFrame([totals])], ignore_index=True)
+            # Network total row
+            if not ac_df.empty:
+                totals = {"Store": "NETWORK TOTAL"}
+                for c in ["Display", "Defective", "Expired",
+                          "Store Shrinkage", "Assumed Receipt", "Total"]:
+                    totals[c] = float(ac_df[c].sum())
+                ac_with_total = pd.concat([ac_df, pd.DataFrame([totals])], ignore_index=True)
+            else:
+                ac_with_total = ac_df
 
-            fmt = {
-                "Overages ($)": "${:,.2f}",
-                "Shortages ($)": "${:,.2f}",
-                "Net ($)": "${:,.2f}",
-                "Sales COGS ($)": "${:,.2f}",
-                "Rate": "{:.2%}",
-            }
+            ac_fmt = {c: "${:,.2f}" for c in
+                      ["Display", "Defective", "Expired",
+                       "Store Shrinkage", "Assumed Receipt", "Total"]}
+            ac_styled = ac_with_total.style.format(ac_fmt, na_rep="N/A")
+            st.dataframe(ac_styled, use_container_width=True, hide_index=True)
 
-            def color_rate(val):
-                if pd.isna(val):
-                    return ""
-                if abs(val) > 0.05:
-                    return "background-color: #ffcccc"
-                if abs(val) > 0.02:
-                    return "background-color: #fff3cd"
-                return ""
-
-            styled = display_with_total.style.format(
-                {k: v for k, v in fmt.items() if k in display_with_total.columns}, na_rep="N/A"
-            )
-            if "Rate" in display_with_total.columns:
-                styled = styled.map(color_rate, subset=["Rate"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-
-            download_buttons(display_with_total, "shrinkage_by_location", "shrink")
-
-            # Breakdown by individual reason within Shrinkage
-            shrink_filtered = period_recon[period_recon["Reason"].isin(REASON_GROUPS["Shrinkage"])]
-            if not shrink_filtered.empty:
-                st.subheader("By Reason")
-                reason_breakdown = (
-                    shrink_filtered.groupby("Reason")
-                    .agg(Adjustments=("COGS", "count"), Total=("COGS", "sum"))
-                    .sort_values("Total")
-                    .reset_index()
-                )
-                fmt_rb = {"Total": "${:,.2f}"}
-                st.dataframe(
-                    reason_breakdown.style.format(fmt_rb, na_rep="N/A"),
-                    use_container_width=True, hide_index=True,
-                )
+            download_buttons(ac_with_total, "accounting_by_location", "ac")
 
     # == Tab Compliance Audit ==
     with tab_compliance:
@@ -2557,37 +2538,6 @@ def main():
             st.dataframe(iq_detail, use_container_width=True, hide_index=True)
             st.caption(f"{len(iq_detail)} adjustments")
             download_buttons(iq_detail, "incorrect_quantity_detail", "iq")
-
-    # == Tab 6: Employees ==
-    with tab6:
-        _, _, emp_detail = aggregate_adjustments(period_recon, shrinkage_reasons)
-        if emp_detail.empty:
-            st.info("No employee shrinkage data for this period.")
-        else:
-            emp_with_cogs = emp_detail.merge(sales_by_store, on="Store", how="left")
-            emp_with_cogs["% of Store COGS"] = emp_with_cogs.apply(
-                lambda r: r["Net_Adjustment"] / r["Store Sales COGS"]
-                if pd.notna(r.get("Store Sales COGS")) and r.get("Store Sales COGS", 0) != 0
-                else None, axis=1,
-            )
-            emp_with_cogs["_s"] = emp_with_cogs["Store"].map(store_sort_key)
-            emp_with_cogs = emp_with_cogs.sort_values(["_s", "Net_Adjustment"]).drop(columns="_s")
-
-            stores_emp = sorted(emp_with_cogs["Store"].unique(), key=store_sort_key)
-            selected_emp_stores = st.multiselect(
-                "Filter by location:", options=stores_emp, default=stores_emp, key="emp_store_filter",
-            )
-            filtered_emp = emp_with_cogs[emp_with_cogs["Store"].isin(selected_emp_stores)]
-
-            display_cols = ["Store", "Employee Name", "Adjustments", "Gains", "Losses", "Net_Adjustment", "% of Store COGS"]
-            avail = [c for c in display_cols if c in filtered_emp.columns]
-            fmt_emp = {"Gains": "${:,.2f}", "Losses": "${:,.2f}", "Net_Adjustment": "${:,.2f}", "% of Store COGS": "{:.2%}"}
-            styled_emp = filtered_emp[avail].style.format(
-                {k: v for k, v in fmt_emp.items() if k in avail}, na_rep="N/A"
-            )
-            st.dataframe(styled_emp, use_container_width=True, hide_index=True)
-            st.caption(f"{len(filtered_emp)} employees")
-            download_buttons(filtered_emp[avail], "employee_shrinkage", "emp")
 
     # == Tab 7: Raw Data ==
     with tab7:
