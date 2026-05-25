@@ -11,6 +11,21 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.2 (2026-05-25)
+- Per-Store Homework: Shrinkage summary and Adjustment Breakdown merged into
+  one table. Sales COGS and shrinkage % columns appended to the right of the
+  cross-tab. Red highlight on % when the absolute breach exceeds 2. Click
+  behavior preserved (row scopes by Category, column by Reason, both by cell).
+- Reason code display: INCORRECT_QUANTITY shows as INCORRECT_QTY across the
+  Reason Code Audit and Per-Store Homework cross-tabs to save column width.
+- Per-Store Homework: Select-all-visible checkbox above the drill table.
+  When ticked, the Add button adds every row in the current filtered view
+  instead of just the rows the user clicked.
+- Per-Store Homework: em dashes removed from on-page captions, subheaders,
+  status lines, and zero-cell renderer to match Charles's voice rule.
+- Homework workbook export: $ formatting on COGS / Cost per Unit / Sales COGS,
+  % formatting on the rate column. Quantity columns get comma thousands.
+  No more raw decimals in Lisa's GM packet.
 v2.6.1 (2026-05-19)
 - Reason Code Audit: cross-tab cells are now drillable. Click a (Shop, Category)
   row + a Reason column on the top cross-tab to open the underlying transactions
@@ -89,7 +104,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -148,6 +163,13 @@ LISA_DRILL_COLS = [
 # the CSV's "Batch SKU" column is that field, but the label is ambiguous.
 DRILL_DISPLAY_LABELS = {
     "Batch SKU": "Blaze Batch",
+}
+
+# Display labels for reason codes — shortens to fit the combined Per-Store
+# Adjustment Breakdown table without wrapping. Underlying constants and CSV
+# values are untouched (filters / classification all still key on the raw code).
+REASON_DISPLAY_LABELS = {
+    "INCORRECT_QUANTITY": "INCORRECT_QTY",
 }
 
 # -- Reason system --
@@ -1335,7 +1357,7 @@ def main():
 
                 def _col_label(r):
                     prefix = "🚫 " if r in DNU_REASONS else "✅ " if r in APPROVED_REASONS else "⚠️ "
-                    return f"{prefix}{r}"
+                    return f"{prefix}{REASON_DISPLAY_LABELS.get(r, r)}"
                 xt_display = xt.rename(columns={r: _col_label(r) for r in xt.columns})
                 dnu_col_labels = [_col_label(r) for r in dnu_cols]
 
@@ -1471,10 +1493,11 @@ def main():
     # == Tab Per-Store Homework ==
     with tab_workbook:
         st.caption(
-            "Build one store's GM homework. Pick a store → scan the Shrinkage summary → click "
-            "into the Adjustment Breakdown (row = Category, column = Reason, both = cell) → "
-            "flag individual transactions in the drill → download Explanations Needed. "
-            "Switching stores clears the current cart — download first if you want to keep it."
+            "Build one store's GM homework. Pick a store, scan the combined "
+            "Adjustment Breakdown (Sales COGS + % on the right, 2% breaches highlighted), "
+            "click row / column / cell to scope the drill, flag transactions, "
+            "download Explanations Needed. Switching stores clears the current cart "
+            "(download first if you want to keep it)."
         )
 
         period_recon_wb = period_recon.copy() if not period_recon.empty else pd.DataFrame()
@@ -1506,13 +1529,6 @@ def main():
             else:
                 cat_sales_wb = pd.DataFrame(columns=["Store", "Category", "Sales COGS"])
 
-            def _color_breach_wb(val):
-                if pd.isna(val):
-                    return ""
-                if abs(val) > 0.02:
-                    return "background-color: #ffcccc"
-                return ""
-
             def _classify_reason_wb(r):
                 if r in APPROVED_REASONS:
                     return "✅ Approved"
@@ -1522,13 +1538,13 @@ def main():
 
             # ----- Store picker -----
             available_stores = [s for s in STORE_ORDER if s in period_recon_wb["Store"].unique()]
-            picker_options = ["— pick a store —"] + available_stores
+            picker_options = ["(pick a store)"] + available_stores
             picked = st.selectbox(
                 "Pick a store",
                 options=picker_options,
                 key="lw_store_picker",
             )
-            selected_store = None if picked == "— pick a store —" else picked
+            selected_store = None if picked == "(pick a store)" else picked
 
             # Cart-clears-on-switch: if the store selection changed, clear the cart.
             prev_store = st.session_state["homework_cart_store"]
@@ -1549,78 +1565,70 @@ def main():
                 )
                 store_recon = period_recon_wb[period_recon_wb["Store"] == selected_store]
 
-                # ----- Shrinkage summary (matches her workbook's Shrinkage tab) -----
+                # ----- Combined Adjustment Breakdown (with Sales COGS + % cols) -----
+                # Merges what used to be the separate Shrinkage summary into the
+                # Adjustment Breakdown cross-tab so Lisa can scan reason mix AND
+                # breach % from one table. Click behavior preserved: row scopes
+                # by Category, column scopes by Reason, both scope to a cell.
                 st.markdown("---")
-                st.subheader(f"Shrinkage summary — {selected_store}")
-                st.caption("Per-Category OVERSOLD + UNDERSOLD vs Sales COGS. Categories breaching 2% highlighted.")
+                st.subheader(f"Adjustment Breakdown ({selected_store})")
+                st.caption(
+                    "Categories in rows, Reasons in columns, SUM of COGS in cells. "
+                    "Sales COGS + shrinkage % on the right (red highlight when |%| > 2). "
+                    "Click a row to scope by Category, a column header to scope by Reason, "
+                    "both to drill into a cell. Click again to deselect."
+                )
 
-                shrink_recon = store_recon[store_recon["Reason"].isin(["OVERSOLD", "UNDERSOLD"])]
-                # Build the universe of categories from BOTH sales and shrinkage so that
-                # categories with sales but zero shrinkage still appear as 0/0 — Lisa needs
-                # those rows present so the Total reconciles to per-store Sales COGS.
+                # Universe of categories: union of sales + recon so that zero-shrink
+                # categories still appear and the Grand Total reconciles to store
+                # Sales COGS.
                 store_sales_cats = set()
                 if not cat_sales_wb.empty:
                     store_sales_cats = set(
                         cat_sales_wb.loc[cat_sales_wb["Store"] == selected_store, "Category"].dropna().unique()
                     )
-                shrink_cats = set(shrink_recon["Category Name"].dropna().unique()) if not shrink_recon.empty else set()
-                all_cats = sorted(store_sales_cats | shrink_cats)
+                recon_cats = set(store_recon["Category Name"].dropna().unique()) if not store_recon.empty else set()
+                all_cats = sorted(store_sales_cats | recon_cats)
 
-                if not all_cats:
-                    st.info("No categories with sales or shrinkage for this store in this period.")
-                    shrink_summary_df = pd.DataFrame()
-                else:
-                    summary_rows = []
-                    for cat in all_cats:
-                        cat_data = shrink_recon[shrink_recon["Category Name"] == cat] if not shrink_recon.empty else pd.DataFrame()
-                        oversold = cat_data[cat_data["Reason"] == "OVERSOLD"]["COGS"].sum() if not cat_data.empty else 0
-                        undersold = cat_data[cat_data["Reason"] == "UNDERSOLD"]["COGS"].sum() if not cat_data.empty else 0
-                        tac = oversold + undersold
-                        ccogs = cat_sales_wb[
-                            (cat_sales_wb["Store"] == selected_store)
-                            & (cat_sales_wb["Category"] == cat)
-                        ]["Sales COGS"].sum() if "Sales COGS" in cat_sales_wb.columns else 0
-                        summary_rows.append({
-                            "Category Name": cat,
-                            "SUM of OVERSOLD": oversold,
-                            "SUM of UNDERSOLD": undersold,
-                            "SUM of TRUE AUDIT COST": tac,
-                            "SUM of COGS": ccogs,
-                            "%": tac / ccogs if ccogs else None,
-                        })
-                    s_oversold = shrink_recon[shrink_recon["Reason"] == "OVERSOLD"]["COGS"].sum()
-                    s_undersold = shrink_recon[shrink_recon["Reason"] == "UNDERSOLD"]["COGS"].sum()
-                    s_tac = s_oversold + s_undersold
-                    s_cogs = sales_by_store[
-                        sales_by_store["Store"] == selected_store
-                    ]["Store Sales COGS"].sum() if not sales_by_store.empty else 0
+                # Per-category Sales COGS lookup + store total (used by Grand Total row)
+                sales_cogs_by_cat = {}
+                if not cat_sales_wb.empty:
+                    store_sales_slice = cat_sales_wb[cat_sales_wb["Store"] == selected_store]
+                    sales_cogs_by_cat = dict(zip(store_sales_slice["Category"], store_sales_slice["Sales COGS"]))
+                store_total_sales_cogs = float(
+                    sales_by_store[sales_by_store["Store"] == selected_store]["Store Sales COGS"].sum()
+                ) if not sales_by_store.empty else 0.0
+
+                # shrink_summary_df is still built here for the export's "Shrinkage" tab
+                # (Lisa's GM packet needs the clean per-cat summary).
+                shrink_recon = store_recon[store_recon["Reason"].isin(["OVERSOLD", "UNDERSOLD"])]
+                summary_rows = []
+                for cat in all_cats:
+                    cat_data = shrink_recon[shrink_recon["Category Name"] == cat] if not shrink_recon.empty else pd.DataFrame()
+                    oversold = cat_data[cat_data["Reason"] == "OVERSOLD"]["COGS"].sum() if not cat_data.empty else 0
+                    undersold = cat_data[cat_data["Reason"] == "UNDERSOLD"]["COGS"].sum() if not cat_data.empty else 0
+                    tac = oversold + undersold
+                    ccogs = float(sales_cogs_by_cat.get(cat, 0))
                     summary_rows.append({
-                        "Category Name": "Total",
-                        "SUM of OVERSOLD": s_oversold,
-                        "SUM of UNDERSOLD": s_undersold,
-                        "SUM of TRUE AUDIT COST": s_tac,
-                        "SUM of COGS": s_cogs,
-                        "%": s_tac / s_cogs if s_cogs else None,
+                        "Category Name": cat,
+                        "SUM of OVERSOLD": oversold,
+                        "SUM of UNDERSOLD": undersold,
+                        "SUM of TRUE AUDIT COST": tac,
+                        "SUM of COGS": ccogs,
+                        "%": tac / ccogs if ccogs else None,
                     })
-                    shrink_summary_df = pd.DataFrame(summary_rows)
-                    summary_styled = shrink_summary_df.style.format({
-                        "SUM of OVERSOLD": "${:,.2f}",
-                        "SUM of UNDERSOLD": "${:,.2f}",
-                        "SUM of TRUE AUDIT COST": "${:,.2f}",
-                        "SUM of COGS": "${:,.2f}",
-                        "%": "{:.2%}",
-                    }, na_rep="").map(_color_breach_wb, subset=["%"])
-                    st.dataframe(summary_styled, use_container_width=True, hide_index=True, height=380)
-
-                # ----- Adjustment Breakdown (drill anchor) -----
-                st.markdown("---")
-                st.subheader(f"Adjustment Breakdown — {selected_store}")
-                st.caption(
-                    "Categories in rows, Reasons in columns. SUM of COGS in cells with Grand "
-                    "Total row + column. Click a row to scope the drill by Category, click a "
-                    "column header to scope by Reason, click both to drill into a single cell. "
-                    "Click again to deselect."
-                )
+                s_oversold = shrink_recon["COGS"][shrink_recon["Reason"] == "OVERSOLD"].sum() if not shrink_recon.empty else 0
+                s_undersold = shrink_recon["COGS"][shrink_recon["Reason"] == "UNDERSOLD"].sum() if not shrink_recon.empty else 0
+                s_tac = s_oversold + s_undersold
+                summary_rows.append({
+                    "Category Name": "Total",
+                    "SUM of OVERSOLD": s_oversold,
+                    "SUM of UNDERSOLD": s_undersold,
+                    "SUM of TRUE AUDIT COST": s_tac,
+                    "SUM of COGS": store_total_sales_cogs,
+                    "%": s_tac / store_total_sales_cogs if store_total_sales_cogs else None,
+                })
+                shrink_summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
 
                 xt3 = pd.pivot_table(
                     store_recon,
@@ -1631,31 +1639,68 @@ def main():
                     fill_value=0,
                     margins=True,
                     margins_name="Grand Total",
-                )
+                ) if not store_recon.empty else pd.DataFrame(index=pd.Index([], name="Category Name"))
+
+                # Reindex to include all_cats (sales-only cats show as zero rows so
+                # the Grand Total reconciles to store Sales COGS).
+                xt3 = xt3.reindex(all_cats + ["Grand Total"], fill_value=0)
+
                 reason_cols_present = [c for c in xt3.columns if c != "Grand Total"]
                 xt3_dnu_cols = sorted([r for r in reason_cols_present if r in DNU_REASONS])
                 xt3_appr_cols = sorted([r for r in reason_cols_present if r in APPROVED_REASONS])
                 xt3_unk_cols = sorted([r for r in reason_cols_present if r not in DNU_REASONS and r not in APPROVED_REASONS])
-                xt3_ordered = xt3_dnu_cols + xt3_unk_cols + xt3_appr_cols + ["Grand Total"]
+                xt3_ordered = xt3_dnu_cols + xt3_unk_cols + xt3_appr_cols + (["Grand Total"] if "Grand Total" in xt3.columns else [])
                 xt3 = xt3[xt3_ordered]
 
+                # Append Sales COGS + % columns
+                sales_cogs_series = pd.Series(
+                    {cat: float(sales_cogs_by_cat.get(cat, 0)) for cat in xt3.index if cat != "Grand Total"},
+                    dtype=float,
+                )
+                sales_cogs_series["Grand Total"] = store_total_sales_cogs
+                xt3["Sales COGS"] = xt3.index.map(sales_cogs_series).astype(float)
+
+                # % = (OVERSOLD + UNDERSOLD) / Sales COGS per row
+                ov = xt3["OVERSOLD"] if "OVERSOLD" in xt3.columns else 0
+                un = xt3["UNDERSOLD"] if "UNDERSOLD" in xt3.columns else 0
+                tac_series = ov + un
+                if isinstance(tac_series, pd.Series):
+                    pct_series = tac_series.divide(xt3["Sales COGS"]).where(xt3["Sales COGS"] != 0, other=pd.NA)
+                else:
+                    pct_series = pd.Series(pd.NA, index=xt3.index, dtype="object")
+                xt3["%"] = pct_series
+
                 def _xt3_label(r):
-                    if r == "Grand Total":
+                    if r in ("Grand Total", "Sales COGS", "%"):
                         return r
                     prefix = "🚫 " if r in DNU_REASONS else "✅ " if r in APPROVED_REASONS else "⚠️ "
-                    return f"{prefix}{r}"
+                    return f"{prefix}{REASON_DISPLAY_LABELS.get(r, r)}"
                 xt3_display = xt3.rename(columns={r: _xt3_label(r) for r in xt3.columns})
                 xt3_dnu_labels = [_xt3_label(r) for r in xt3_dnu_cols]
                 xt3_unk_labels = [_xt3_label(r) for r in xt3_unk_cols]
 
-                def _xt3_fmt(v):
+                def _xt3_fmt_dollar(v):
                     if pd.isna(v) or float(v) == 0.0:
-                        return "—"
+                        return ""
                     return f"${v:,.2f}"
+
+                def _xt3_fmt_pct(v):
+                    if pd.isna(v):
+                        return ""
+                    return f"{v:.2%}"
 
                 def _xt3_style(df):
                     styles = pd.DataFrame("", index=df.index, columns=df.columns)
                     for c in df.columns:
+                        if c == "%":
+                            pct_vals = pd.to_numeric(df[c], errors="coerce")
+                            breach = (pct_vals.abs() > 0.02).fillna(False)
+                            styles.loc[breach, c] = "background-color: #ffcccc; color: #800000; font-weight: 700; text-align: right;"
+                            styles.loc[~breach, c] = "text-align: right;"
+                            continue
+                        if c == "Sales COGS":
+                            styles.loc[:, c] = "color: #1a1a1a; background-color: #f7f7f7; text-align: right;"
+                            continue
                         nonzero = df[c].abs() > 0.0
                         zero = ~nonzero
                         styles.loc[zero, c] = "color: #cccccc; text-align: right;"
@@ -1673,8 +1718,9 @@ def main():
                             styles.loc["Grand Total", c] = (base + "; background-color: #f0f0f0; font-weight: 700;").lstrip("; ")
                     return styles
 
-                fmt_xt3 = {c: _xt3_fmt for c in xt3_display.columns}
-                xt3_styled = xt3_display.style.format(fmt_xt3, na_rep="—").apply(_xt3_style, axis=None)
+                fmt_xt3 = {c: _xt3_fmt_dollar for c in xt3_display.columns if c != "%"}
+                fmt_xt3["%"] = _xt3_fmt_pct
+                xt3_styled = xt3_display.style.format(fmt_xt3, na_rep="").apply(_xt3_style, axis=None)
 
                 xt3_key = f"lw_xt3_event_v{st.session_state['lw_pivot_event_version']}_{selected_store}"
                 xt3_event = st.dataframe(
@@ -1734,10 +1780,10 @@ def main():
 
                 # ----- Drill panel -----
                 st.markdown("---")
-                st.subheader("Drill — flag transactions for the homework")
+                st.subheader("Drill (flag transactions for the homework)")
                 st.caption(
                     "All reconciliations for this store. Pre-sorted by absolute COGS so the largest "
-                    "amounts surface first. Each row carries its own Reason — flag any transaction, "
+                    "amounts surface first. Each row carries its own Reason, flag any transaction, "
                     "not just OVERSOLD/UNDERSOLD shrinkage. Click on Adjustment Breakdown above to "
                     "scope automatically, or use the manual filters."
                 )
@@ -1801,9 +1847,20 @@ def main():
                 drill_tac_total = drill_scope["COGS"].sum()
                 drill_flagged_in_view = int(drill_scope["✓"].eq("✓").sum())
                 st.markdown(
-                    f"**{len(drill_scope):,} transaction(s) visible** — sum COGS "
+                    f"**{len(drill_scope):,} transaction(s) visible.** sum COGS "
                     f"${drill_tac_total:,.2f} · {drill_flagged_in_view} already in cart"
                 )
+
+                # Select all visible: when ticked, the Add button below adds every
+                # txn in the current filtered drill view (ignores per-row selection).
+                select_all_key = f"lw_select_all_{selected_store}_{filter_sig}"
+                select_all = st.checkbox(
+                    f"☑ Select all visible ({len(drill_scope):,})",
+                    value=False,
+                    key=select_all_key,
+                    help="Add every row in the current filtered view, not just the rows you clicked.",
+                )
+
                 drill_event = st.dataframe(
                     _apply_drill_labels(drill_display.drop(columns="_txn_id")),
                     use_container_width=True,
@@ -1821,26 +1878,33 @@ def main():
                     [drill_display.iloc[i]["_txn_id"] for i in drill_sel] if drill_sel else []
                 )
 
+                if select_all:
+                    add_txn_ids = list(drill_display["_txn_id"])
+                    add_label = f"➕ Add all {len(add_txn_ids)} visible to Explanations Needed"
+                else:
+                    add_txn_ids = drill_sel_txn_ids
+                    add_label = f"➕ Add {len(add_txn_ids)} to Explanations Needed"
+
                 add_col, info_col = st.columns([1, 3])
                 with add_col:
                     if st.button(
-                        f"➕ Add {len(drill_sel_txn_ids)} to Explanations Needed",
-                        disabled=not drill_sel_txn_ids,
+                        add_label,
+                        disabled=not add_txn_ids,
                         type="primary",
                         key="lw_add_btn",
                     ):
                         st.session_state["homework_cart"] = (
-                            st.session_state["homework_cart"] | set(drill_sel_txn_ids)
+                            st.session_state["homework_cart"] | set(add_txn_ids)
                         )
                         st.session_state["lw_drill_event_version"] += 1
                         st.rerun()
                 with info_col:
-                    if not drill_sel_txn_ids:
-                        st.caption("_Click a row, or shift/Cmd-click for multi-select._")
+                    if not add_txn_ids:
+                        st.caption("_Click a row, or shift/Cmd-click for multi-select. Or tick Select all visible above._")
 
                 # ----- Explanations Needed cart -----
                 st.markdown("---")
-                st.subheader(f"Explanations Needed cart — {selected_store}")
+                st.subheader(f"Explanations Needed cart ({selected_store})")
 
                 cart_set = st.session_state["homework_cart"]
                 cart_rows = store_recon[store_recon["_txn_id"].isin(cart_set)]
@@ -1853,8 +1917,8 @@ def main():
                     drill_cols_for_cart = [c for c in LISA_DRILL_COLS if c in store_recon.columns]
                 else:
                     st.markdown(
-                        f"**{cart_count} transaction(s)** flagged for **{selected_store}** — "
-                        f"total |TAC| **${cart_tac_abs:,.2f}**"
+                        f"**{cart_count} transaction(s)** flagged for **{selected_store}**. "
+                        f"Total |TAC| **${cart_tac_abs:,.2f}**"
                     )
                     cart_rollup = cart_rows.groupby(["Category Name", "Reason"]).agg(
                         Flagged=("COGS", "count"),
@@ -1940,7 +2004,49 @@ def main():
                 cart_export["GM Explanation"] = ""
                 sheets["Explanations needed"] = cart_export
 
-                buf = make_excel_download(sheets)
+                # Build the workbook with Excel number formats so Lisa sees
+                # $-formatted dollars and %-formatted rates, not raw decimals.
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    for sheet_name, df_out in sheets.items():
+                        df_out.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+
+                    DOLLAR_FMT = '"$"#,##0.00;[Red]("$"#,##0.00)'
+                    PCT_FMT = '0.00%;[Red]-0.00%'
+                    QTY_FMT = '#,##0.00;[Red]-#,##0.00'
+
+                    if "Shrinkage" in writer.sheets:
+                        ws_s = writer.sheets["Shrinkage"]
+                        headers_s = [c.value for c in ws_s[1]]
+                        for col_idx, h in enumerate(headers_s, start=1):
+                            if h in ("SUM of OVERSOLD", "SUM of UNDERSOLD",
+                                     "SUM of TRUE AUDIT COST", "SUM of COGS"):
+                                for row in ws_s.iter_rows(min_row=2, min_col=col_idx,
+                                                          max_col=col_idx, max_row=ws_s.max_row):
+                                    for cell in row:
+                                        cell.number_format = DOLLAR_FMT
+                            elif h == "%":
+                                for row in ws_s.iter_rows(min_row=2, min_col=col_idx,
+                                                          max_col=col_idx, max_row=ws_s.max_row):
+                                    for cell in row:
+                                        cell.number_format = PCT_FMT
+
+                    if "Explanations needed" in writer.sheets:
+                        ws_e = writer.sheets["Explanations needed"]
+                        headers_e = [c.value for c in ws_e[1]]
+                        for col_idx, h in enumerate(headers_e, start=1):
+                            if h in ("COGS", "Cost per Unit"):
+                                for row in ws_e.iter_rows(min_row=2, min_col=col_idx,
+                                                          max_col=col_idx, max_row=ws_e.max_row):
+                                    for cell in row:
+                                        cell.number_format = DOLLAR_FMT
+                            elif h == "Difference":
+                                for row in ws_e.iter_rows(min_row=2, min_col=col_idx,
+                                                          max_col=col_idx, max_row=ws_e.max_row):
+                                    for cell in row:
+                                        cell.number_format = QTY_FMT
+                buf.seek(0)
+
                 period_tag = selected_period or "all"
                 safe_store = selected_store.replace(" ", "_").replace("/", "-")
                 st.download_button(
@@ -1953,7 +2059,8 @@ def main():
                 )
                 st.caption(
                     f"Workbook: 'Shrinkage' tab (per-category OVERSOLD/UNDERSOLD for {selected_store}) "
-                    f"+ 'Explanations needed' tab ({cart_count} flagged transaction(s) + GM Explanation column)."
+                    f"+ 'Explanations needed' tab ({cart_count} flagged transaction(s) + GM Explanation column). "
+                    f"Dollar columns formatted as currency; rate column formatted as %."
                 )
 
     # == Tab 3: Legacy Shrink ==
