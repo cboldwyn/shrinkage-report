@@ -11,6 +11,20 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.4 (2026-05-25)
+- Homework export now contains ONLY the Explanations Needed tab. The
+  Shrinkage summary tab is dropped (the combined Adjustment Breakdown
+  on the page is the summary surface; the GM packet is transaction-level).
+- Date Timestamp fallback: if persisted data was uploaded before v2.6.0
+  and is missing Date Timestamp, the export falls back to the Date column
+  so the GM always has a date column.
+- Select all visible: ticking the checkbox now visibly fills the ✓ column
+  on every visible row, so the user can see the selection is active.
+- Google Sheet creation: supports a per-app Drive folder. When the
+  service account hits its zero-byte storage quota (403), the app now
+  surfaces inline setup steps with the service account email and the
+  exact secrets line to add. Create-as-Google-Sheet button is disabled
+  until at least one transaction is in the cart.
 v2.6.3 (2026-05-25)
 - Per-Store Adjustment Breakdown: multi-select (multi-row + multi-column) on
   the cross-tab. Cmd / shift-click to extend selection. Filter below now
@@ -117,7 +131,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.3"
+VERSION = "2.6.4"
 
 # Email of the human owner of this app — used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -377,12 +391,54 @@ def _col_letter(n):
     return result
 
 
-def make_homework_gsheet(sheets_dict, title, share_with=None):
+def _homework_drive_folder_id():
+    """Drive folder ID for newly-created homework sheets, or None if unset.
+
+    Configured via st.secrets["homework_drive_folder_id"] (top level) or
+    st.secrets["google_sheets"]["homework_folder_id"] (nested). The folder
+    must be owned by a human user and shared with the service account as
+    Editor; the new sheet lives in that user's Drive (bypassing the
+    service account's zero-byte storage quota).
+    """
+    try:
+        top_level = st.secrets.get("homework_drive_folder_id")
+        if top_level:
+            return str(top_level)
+    except Exception:
+        pass
+    try:
+        gs_block = st.secrets.get("google_sheets", {})
+        if isinstance(gs_block, dict):
+            nested = gs_block.get("homework_folder_id")
+        else:
+            nested = gs_block["homework_folder_id"] if "homework_folder_id" in gs_block else None
+        if nested:
+            return str(nested)
+    except Exception:
+        pass
+    return None
+
+
+def _service_account_email():
+    """Return the service account's client_email from secrets, or None."""
+    try:
+        gs_block = st.secrets.get("google_sheets", {})
+        if isinstance(gs_block, dict):
+            return gs_block.get("client_email")
+        return gs_block["client_email"] if "client_email" in gs_block else None
+    except Exception:
+        return None
+
+
+def make_homework_gsheet(sheets_dict, title, share_with=None, folder_id=None):
     """Upload the homework workbook to a new Google Sheet and return the URL.
 
     sheets_dict: {sheet_name: DataFrame} — same shape as the xlsx writer.
     title: Sheet title (will get a timestamp suffix).
     share_with: list of email addresses to grant writer access to (notify=False).
+    folder_id: Drive folder ID to create the sheet inside. Folder must be
+        shared with the service account as Editor. When provided, the new
+        sheet is owned by the folder's owner (avoids service-account quota).
 
     Returns the spreadsheet URL string. Raises if Google Sheets isn't configured.
     """
@@ -392,7 +448,10 @@ def make_homework_gsheet(sheets_dict, title, share_with=None):
     gc = get_gspread_client()
     ts = datetime.now().strftime("%Y-%m-%d %H%M")
     full_title = f"{title} ({ts})"
-    sh = gc.create(full_title)
+    if folder_id:
+        sh = gc.create(full_title, folder_id=folder_id)
+    else:
+        sh = gc.create(full_title)
 
     # Share with the requested emails so users can open + edit. Service account
     # remains the owner (counts against its Drive quota).
@@ -1713,36 +1772,10 @@ def main():
                     sales_by_store[sales_by_store["Store"] == selected_store]["Store Sales COGS"].sum()
                 ) if not sales_by_store.empty else 0.0
 
-                # shrink_summary_df is still built here for the export's "Shrinkage" tab
-                # (Lisa's GM packet needs the clean per-cat summary).
+                # (Per-cat shrink summary build dropped in v2.6.4: the homework
+                # export now contains only the Explanations Needed tab. The combined
+                # Adjustment Breakdown above is the on-page summary surface.)
                 shrink_recon = store_recon[store_recon["Reason"].isin(["OVERSOLD", "UNDERSOLD"])]
-                summary_rows = []
-                for cat in all_cats:
-                    cat_data = shrink_recon[shrink_recon["Category Name"] == cat] if not shrink_recon.empty else pd.DataFrame()
-                    oversold = cat_data[cat_data["Reason"] == "OVERSOLD"]["COGS"].sum() if not cat_data.empty else 0
-                    undersold = cat_data[cat_data["Reason"] == "UNDERSOLD"]["COGS"].sum() if not cat_data.empty else 0
-                    tac = oversold + undersold
-                    ccogs = float(sales_cogs_by_cat.get(cat, 0))
-                    summary_rows.append({
-                        "Category Name": cat,
-                        "SUM of OVERSOLD": oversold,
-                        "SUM of UNDERSOLD": undersold,
-                        "SUM of TRUE AUDIT COST": tac,
-                        "SUM of COGS": ccogs,
-                        "%": tac / ccogs if ccogs else None,
-                    })
-                s_oversold = shrink_recon["COGS"][shrink_recon["Reason"] == "OVERSOLD"].sum() if not shrink_recon.empty else 0
-                s_undersold = shrink_recon["COGS"][shrink_recon["Reason"] == "UNDERSOLD"].sum() if not shrink_recon.empty else 0
-                s_tac = s_oversold + s_undersold
-                summary_rows.append({
-                    "Category Name": "Total",
-                    "SUM of OVERSOLD": s_oversold,
-                    "SUM of UNDERSOLD": s_undersold,
-                    "SUM of TRUE AUDIT COST": s_tac,
-                    "SUM of COGS": store_total_sales_cogs,
-                    "%": s_tac / store_total_sales_cogs if store_total_sales_cogs else None,
-                })
-                shrink_summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
 
                 xt3 = pd.pivot_table(
                     store_recon,
@@ -1949,35 +1982,48 @@ def main():
                 drill_scope["_abs_cogs"] = drill_scope["COGS"].abs()
                 drill_scope = drill_scope.sort_values("_abs_cogs", ascending=False).drop(columns="_abs_cogs")
 
-                cart_set_view = st.session_state["homework_cart"]
-                drill_scope["✓"] = drill_scope["_txn_id"].apply(lambda t: "✓" if t in cart_set_view else "")
-                drill_display = drill_scope[["✓"] + drill_cols + ["_txn_id"]].reset_index(drop=True)
-
-                # Key includes filter signature: when filter changes the row positions change too,
-                # so we must reset selection state to avoid the multi-row select pointing at wrong rows.
+                # Filter signature drives drill key + select-all key so both reset
+                # cleanly when the filter changes.
                 filter_sig = (
                     f"{tuple(sorted(drill_cat_filter))}_"
                     f"{tuple(sorted(drill_reason_filter))}_{drill_dnu_only}"
                 )
-                drill_key = (
-                    f"lw_drill_event_v{st.session_state['lw_drill_event_version']}_"
-                    f"{selected_store}_{filter_sig}"
-                )
+
                 drill_tac_total = drill_scope["COGS"].sum()
-                drill_flagged_in_view = int(drill_scope["✓"].eq("✓").sum())
+                cart_set_view = st.session_state["homework_cart"]
+                already_in_cart = int(drill_scope["_txn_id"].isin(cart_set_view).sum())
                 st.markdown(
-                    f"**{len(drill_scope):,} transaction(s) visible.** sum COGS "
-                    f"${drill_tac_total:,.2f} · {drill_flagged_in_view} already in cart"
+                    f"**{len(drill_scope):,} transaction(s) visible.** Sum COGS "
+                    f"${drill_tac_total:,.2f} · {already_in_cart} already in cart"
                 )
 
-                # Select all visible: when ticked, the Add button below adds every
-                # txn in the current filtered drill view (ignores per-row selection).
+                # Select all visible: when ticked, every visible row shows ✓ as
+                # a visual cue AND the Add button switches to "Add all visible"
+                # (no need to click individual rows).
                 select_all_key = f"lw_select_all_{selected_store}_{filter_sig}"
                 select_all = st.checkbox(
-                    f"☑ Select all visible ({len(drill_scope):,})",
+                    f"☑ Select all visible ({len(drill_scope):,} rows)",
                     value=False,
                     key=select_all_key,
-                    help="Add every row in the current filtered view, not just the rows you clicked.",
+                    help="Tick to flag every row in the current filtered view at once.",
+                )
+
+                # ✓ column logic: when select_all is ON, every visible row gets ✓
+                # (visual feedback the user expects). When OFF, only cart members
+                # carry the ✓.
+                if select_all:
+                    drill_scope["✓"] = "✓"
+                else:
+                    drill_scope["✓"] = drill_scope["_txn_id"].apply(
+                        lambda t: "✓" if t in cart_set_view else ""
+                    )
+                drill_display = drill_scope[["✓"] + drill_cols + ["_txn_id"]].reset_index(drop=True)
+
+                # Key depends on select_all state too, so the visual ✓ refreshes
+                # immediately when the user toggles select-all.
+                drill_key = (
+                    f"lw_drill_event_v{st.session_state['lw_drill_event_version']}_"
+                    f"{selected_store}_{filter_sig}_sa{int(select_all)}"
                 )
 
                 drill_event = st.dataframe(
@@ -2100,55 +2146,57 @@ def main():
                                 st.session_state["lw_cart_event_version"] += 1
                                 st.rerun()
 
-                # ----- Download per-store homework (always available once a store is picked) -----
+                # ----- Download per-store homework (Explanations Needed only) -----
+                # Per Charles 5/25: drop the Shrinkage summary tab. The download
+                # is the transaction-level packet for the store GM to fill in
+                # explanations against. No category-summary noise.
                 st.markdown("---")
-                sheets = {}
-                # Shrinkage tab: always include, even when no categories breach. Lisa wants
-                # the per-category summary in every download for the GM packet.
-                if not shrink_summary_df.empty:
-                    sheets["Shrinkage"] = shrink_summary_df.copy()
-                else:
-                    sheets["Shrinkage"] = pd.DataFrame(
-                        columns=["Category Name", "SUM of OVERSOLD", "SUM of UNDERSOLD",
-                                 "SUM of TRUE AUDIT COST", "SUM of COGS", "%"]
-                    )
 
-                # Explanations needed tab: rename Batch SKU → Blaze Batch for clarity, add GM column.
+                # Date Timestamp fallback: if the persisted recon data was
+                # uploaded before v2.6.0 (no Date Timestamp column), use the
+                # plain Date column so the GM packet still has a date column.
+                def _ensure_date_col(df, source_df):
+                    """Add a Date Timestamp column if missing, using Date as fallback."""
+                    if "Date Timestamp" in df.columns:
+                        return df
+                    if "Date Timestamp" in source_df.columns:
+                        df = df.copy()
+                        df.insert(0, "Date Timestamp",
+                                  source_df.loc[df.index, "Date Timestamp"]
+                                  if df.index.isin(source_df.index).all()
+                                  else source_df["Date Timestamp"].reindex(df.index))
+                        return df
+                    if "Date" in source_df.columns:
+                        df = df.copy()
+                        df.insert(0, "Date Timestamp",
+                                  source_df["Date"].reindex(df.index))
+                        return df
+                    return df
+
+                # Build the Explanations Needed cart export. Ensure Date Timestamp
+                # is present even if the upstream persisted data dropped it.
                 if cart_count > 0:
-                    cart_export = _apply_drill_labels(cart_sorted[drill_cols_for_cart].copy())
+                    cart_export = cart_sorted[drill_cols_for_cart].copy()
+                    cart_export = _ensure_date_col(cart_export, cart_sorted)
+                    cart_export = _apply_drill_labels(cart_export)
                 else:
                     cart_export = pd.DataFrame(
-                        columns=[DRILL_DISPLAY_LABELS.get(c, c) for c in drill_cols_for_cart]
+                        columns=["Date Timestamp"] + [DRILL_DISPLAY_LABELS.get(c, c)
+                                                     for c in drill_cols_for_cart
+                                                     if c != "Date Timestamp"]
                     )
                 cart_export["GM Explanation"] = ""
-                sheets["Explanations needed"] = cart_export
 
-                # Build the workbook with Excel number formats so Lisa sees
-                # $-formatted dollars and %-formatted rates, not raw decimals.
+                sheets = {"Explanations needed": cart_export}
+
+                # Build the xlsx with currency / number formats.
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                     for sheet_name, df_out in sheets.items():
                         df_out.to_excel(writer, index=False, sheet_name=sheet_name[:31])
 
                     DOLLAR_FMT = '"$"#,##0.00;[Red]("$"#,##0.00)'
-                    PCT_FMT = '0.00%;[Red]-0.00%'
                     QTY_FMT = '#,##0.00;[Red]-#,##0.00'
-
-                    if "Shrinkage" in writer.sheets:
-                        ws_s = writer.sheets["Shrinkage"]
-                        headers_s = [c.value for c in ws_s[1]]
-                        for col_idx, h in enumerate(headers_s, start=1):
-                            if h in ("SUM of OVERSOLD", "SUM of UNDERSOLD",
-                                     "SUM of TRUE AUDIT COST", "SUM of COGS"):
-                                for row in ws_s.iter_rows(min_row=2, min_col=col_idx,
-                                                          max_col=col_idx, max_row=ws_s.max_row):
-                                    for cell in row:
-                                        cell.number_format = DOLLAR_FMT
-                            elif h == "%":
-                                for row in ws_s.iter_rows(min_row=2, min_col=col_idx,
-                                                          max_col=col_idx, max_row=ws_s.max_row):
-                                    for cell in row:
-                                        cell.number_format = PCT_FMT
 
                     if "Explanations needed" in writer.sheets:
                         ws_e = writer.sheets["Explanations needed"]
@@ -2184,15 +2232,17 @@ def main():
                         if st.button(
                             f"🔗 Create as Google Sheet",
                             key="lw_homework_gs_btn",
-                            help="Creates a live Google Sheet with the same two tabs. "
-                                 "Share with the GM directly from the sheet.",
+                            help="Creates a live Google Sheet you can share with the GM directly.",
+                            disabled=(cart_count == 0),
                         ):
                             with st.spinner("Creating Google Sheet..."):
+                                folder_id = _homework_drive_folder_id()
                                 try:
                                     gs_url = make_homework_gsheet(
                                         sheets,
                                         title=f"Homework {selected_store} {period_tag}",
                                         share_with=[USER_EMAIL],
+                                        folder_id=folder_id,
                                     )
                                     st.session_state["lw_homework_gs_url"] = gs_url
                                     st.session_state["lw_homework_gs_label"] = (
@@ -2200,7 +2250,28 @@ def main():
                                         f"{cart_count} flagged txn"
                                     )
                                 except Exception as e:
-                                    st.error(f"Could not create Google Sheet: {e}")
+                                    err_str = str(e)
+                                    if "storage quota" in err_str.lower() or "[403]" in err_str:
+                                        st.error(
+                                            "Google Drive storage quota exceeded on the service account. "
+                                            "To fix this, you need to point the app at a Drive folder you "
+                                            "own (the file then lives in your Drive, not the service account's)."
+                                        )
+                                        sa_email = _service_account_email()
+                                        st.markdown(
+                                            f"**One-time setup:**\n\n"
+                                            f"1. In Google Drive, create a folder (e.g. 'Shrinkage Homework Sheets').\n"
+                                            f"2. Right-click the folder, Share, add **`{sa_email or '(service account email from your Streamlit secrets)'}`** as Editor.\n"
+                                            f"3. Copy the folder ID from the URL (the part after `/folders/`).\n"
+                                            f"4. In Streamlit Cloud, open this app's Settings, Secrets, "
+                                            f"and add the line:  \n"
+                                            f"   `homework_drive_folder_id = \"<paste folder ID here>\"`\n"
+                                            f"5. Reload the app and try Create as Google Sheet again."
+                                        )
+                                    else:
+                                        st.error(f"Could not create Google Sheet: {e}")
+                        if cart_count == 0:
+                            st.caption("_Flag transactions first (drill panel above), then create the sheet._")
                     else:
                         st.caption("Google Sheets not configured.")
 
@@ -2212,10 +2283,10 @@ def main():
                     )
 
                 st.caption(
-                    f"Workbook: 'Shrinkage' tab (per-category OVERSOLD/UNDERSOLD for {selected_store}) "
-                    f"+ 'Explanations needed' tab ({cart_count} flagged transaction(s) + GM Explanation column). "
-                    f"Dollar columns formatted as currency, rate column as %. The Explanations tab "
-                    f"is populated from the drill panel above (flag transactions and Add to Explanations Needed first)."
+                    f"Workbook: 'Explanations needed' tab ({cart_count} flagged transaction(s) "
+                    f"with a blank GM Explanation column for the store manager to fill in). "
+                    f"COGS and Cost per Unit formatted as currency. Populated from the drill "
+                    f"panel above (flag transactions and Add to Explanations Needed first)."
                 )
 
     # == Tab 3: Legacy Shrink ==
