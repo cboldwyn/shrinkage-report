@@ -1,5 +1,5 @@
 """
-Shrinkage Dashboard v2.0.0
+Shrinkage Dashboard
 Persistent shrinkage dashboard for Haven retail locations.
 
 Tracks inventory adjustment costs against sales COGS with weekly/monthly
@@ -11,13 +11,61 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.1 (2026-05-19)
+- Reason Code Audit: cross-tab cells are now drillable. Click a (Shop, Category)
+  row + a Reason column on the top cross-tab to open the underlying transactions
+  panel below. Falls back to long-format row-pick when the cross-tab has no
+  full (row+column) selection.
+- Per-Store Homework: zero-shrink categories now appear in the Shrinkage summary
+  as 0/0 rows so the Total reconciles cleanly to per-store Sales COGS.
+- Per-Store Homework: Category multi-select now preserves the user's picks when
+  the Adjustment Breakdown deselects. Cross-tab selection now ADDs to the filter
+  set rather than replacing it. Same fix for the Reason filter.
+- Per-Store Homework: Lisa drill column order locked left-to-right by priority:
+  Date Timestamp / Store / Employee / Product / Difference / COGS / Reason /
+  Reason Note / Batch / Metrc Adjustment / Cost per Unit.
+- "Batch SKU" column now displays as "Blaze Batch" in all drill / cart / homework
+  views and the downloaded workbook. (Underlying CSV column name unchanged.)
+- Per-store Homework Excel download is always available once a store is picked,
+  even with an empty cart. Workbook always has both Shrinkage and Explanations
+  needed tabs (empty Shrinkage tab still has the category-header schema).
+v2.6.0 (2026-05-14)
+- New tab: ✅ Compliance Audit. Network-wide reason-code + dollar-amount scan
+  matching the `Pivot Table2` layout from Lisa's monthly template. Renders
+  BOTH a cross-tab (Shop × Category in rows, Reason in columns, SUM of COGS
+  in cells; DNU columns first and colored red) AND a long-format
+  sortable/filterable list (Compliance | Shop | Category | Reason |
+  Adjustments | SUM of COGS) below. Filters: Store, Compliance status,
+  Min |COGS|. Read-only — no transaction drill on this tab.
+- New tab: 📝 Per-Store Homework. Replicates Lisa's per-store workbook flow
+  end-to-end: pick a store → see her Shrinkage summary (per-Category
+  OVERSOLD/UNDERSOLD/TAC/COGS/% + Store Total row) → see Pivot Table 3
+  (Category × Reason long-format) → click a Cat-Reason row → drill panel
+  shows underlying transactions → multi-row select + "➕ Add to Explanations
+  Needed" button → cart shows flagged with view/remove/clear → download
+  per-store Excel workbook with 'Shrinkage' and 'Explanations needed' sheets
+  + GM Explanation column. Cart is single-store; switching stores clears
+  the cart (download first to keep it). Uses st.dataframe row-select
+  (not data_editor) for sticky-state-free flagging.
+- DDE Adjustments tab: per-store table broken out by Display / Defective / Expired
+  with sub-group totals as inline metrics.
+- Fix: zero-shrink stores no longer drop from network % denominator. Tab 2 grand
+  total Rate + trends per-period rate were inflating when stores had zero shrinkage.
+- Recon column set expanded: Date Timestamp, Old Quantity, New Quantity, Batch SKU,
+  Metrc Adjustment, Reconciliation No now persisted (re-upload to populate).
+- Lisa drill display drops standalone Date column; Date Timestamp only.
+v2.5.2 (2026-04-15)
+- Legacy Shrink COGS denominator fix (uses full store sales)
+v2.5.1, v2.5.0 (2026-04-15)
+- Legacy Shrink tab with nested store expanders matching Georgina's old pivot
+v2.4.x (2026-04-08 to 04-14)
+- Headlines, reason mapping, DDE group, IQ separate, KeyError fixes
+v2.3.0 (2026-04-07)
+- Sun-Sat business weeks, Incorrect Qty tab, label fixes
+v2.2.0, v2.1.0 (2026-04-04 to 04-06)
+- UX overhaul for readability and actionable insights
 v2.0.0 (2026-04-14)
-- Google Sheets persistence (data accumulates weekly)
-- Report presets with reason groupings (replaces exclude filter)
-- Weekly/monthly period toggle
-- Plotly trend charts: network, per-store, reason composition, top categories
-- Switched from exclude-based to include-based reason filtering
-- Fixed bug: v1.0 included all reasons as "shrinkage" (should be OVERSOLD+UNDERSOLD only)
+- Google Sheets persistence, report presets, plotly trends
 v1.0.0 (2026-03-31)
 - Initial release
 """
@@ -41,7 +89,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.5.2"
+VERSION = "2.6.1"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -78,11 +126,29 @@ RECON_REQUIRED_COLS = [
     "Difference", "Cost per Unit", "COGS", "Reason",
 ]
 RECON_STORE_COLS = [
-    "Date", "Shop", "Store", "Employee Name", "Category Name",
-    "Inventory Name", "Product Name", "Brand Name",
-    "Difference", "Cost per Unit", "COGS", "Reason", "Reason Note",
+    "Date", "Date Timestamp", "Shop", "Store", "Reconciliation No",
+    "Employee Name", "Category Name",
+    "Inventory Name", "Product Name", "Brand Name", "Batch SKU",
+    "Old Quantity", "New Quantity", "Difference", "Metrc Adjustment",
+    "Cost per Unit", "COGS", "Reason", "Reason Note",
 ]
 SALES_REQUIRED_COLS = ["Date", "Shop", "Product Category", "COGS"]
+
+# Lisa's drill-down column subset. Keep order — Lisa scans left to right.
+# Order locked 5/19 PM (DC/Retail Touch Base): the things she needs first are on the left;
+# Batch / Metrc Adjustment / Cost per Unit pushed right of Difference/COGS/Reason/Reason Note.
+LISA_DRILL_COLS = [
+    "Date Timestamp", "Store", "Employee Name", "Product Name",
+    "Difference", "COGS", "Reason", "Reason Note",
+    "Batch SKU", "Metrc Adjustment", "Cost per Unit",
+]
+
+# Display labels — keep underlying CSV column names, only rename for display.
+# Lisa needs the Blaze batch identifier (per-batch UID, often equals METRC tag);
+# the CSV's "Batch SKU" column is that field, but the label is ambiguous.
+DRILL_DISPLAY_LABELS = {
+    "Batch SKU": "Blaze Batch",
+}
 
 # -- Reason system --
 ALL_REASONS = [
@@ -109,6 +175,21 @@ REASON_GROUPS = {
 
 NOT_BILLED_GROUPS = ["Shrinkage", "Incorrect Qty", "Audit", "Samples", "Other"]
 BILLED_GROUPS = ["DDE", "Recall"]
+
+# Approved vs DNU Blaze Reasons per Reconciliation Reasons doc (11/4/25 update).
+# Approved = on the active scenario matrix. DNU = available in Blaze but explicitly off-limits.
+# Stores using DNU reasons get flagged for GM follow-up.
+APPROVED_REASONS = {
+    "OVERSOLD", "UNDERSOLD", "DAMAGED",
+    "WASTE_DISPLAY", "DISPLAY_SAMPLE", "SAMPLES",
+    "WASTE_EXPIRED", "WASTE_RETURN", "WASTE_DISPOSAL",
+    "INCORRECT_QUANTITY", "OTHER",
+}
+DNU_REASONS = {
+    "AUDIT", "PUBLIC_SAFETY_RECALL", "MANDATED_DESTRUCTION", "RETURN_TO_VENDOR",
+    "FREE_CANNABIS_GOODS", "SCALE_VARIANCE", "THEFT", "VOLUNTARY_SURRENDER",
+    "STORE_TRANSFER", "PO_ERROR",
+}
 
 # DDE sub-groups for detail breakdown
 DDE_SUBGROUPS = {
@@ -227,6 +308,15 @@ def get_reasons_for_report(report_name, custom_groups=None):
     for g in groups:
         reasons.extend(REASON_GROUPS.get(g, []))
     return reasons
+
+
+def _apply_drill_labels(df):
+    """Rename drill columns for user-facing display (e.g., Batch SKU → Blaze Batch).
+    Keeps the underlying column name in the source dataframe; only renames a copy."""
+    rename_map = {k: v for k, v in DRILL_DISPLAY_LABELS.items() if k in df.columns}
+    if not rename_map:
+        return df
+    return df.rename(columns=rename_map)
 
 
 def make_excel_download(dataframes_dict):
@@ -523,8 +613,11 @@ def build_period_trend(recon_df, sales_df, period="weekly", include_reasons=None
         .sum()
     )
 
-    # Merge
-    merged = adj.merge(sales_agg, on=["period_id", "Store"], how="left")
+    # Right-merge from sales so every (period, store) with sales is preserved, even when
+    # that store had zero adjustments in the period. Otherwise zero-shrink stores drop from
+    # the denominator and network/period rates inflate.
+    merged = sales_agg.merge(adj, on=["period_id", "Store"], how="left")
+    merged["Net_Adjustment"] = merged["Net_Adjustment"].fillna(0)
     merged["Shrinkage %"] = merged.apply(
         lambda r: r["Net_Adjustment"] / r["Sales COGS"]
         if pd.notna(r.get("Sales COGS")) and r.get("Sales COGS", 0) != 0
@@ -1033,9 +1126,11 @@ def main():
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab_compliance, tab_workbook, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📈 Trends",
         "📊 Shrinkage by Location",
+        "✅ Reason Code Audit",
+        "📝 Per-Store Homework",
         "📋 Legacy Shrink",
         "📦 Adjustments",
         "🔢 Incorrect Quantity",
@@ -1087,15 +1182,18 @@ def main():
             }
             display_df = display_df.rename(columns={k: v for k, v in col_rename.items() if k in display_df.columns})
 
-            # Grand total
+            # Grand total — use full network COGS across all stores (not just stores with
+            # shrinkage in display_df) to keep zero-shrink stores in the denominator.
+            full_network_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
             totals = {"Store": "NETWORK TOTAL"}
             for c in display_df.columns:
                 if c == "Store":
                     continue
                 if c == "Rate":
                     net = display_df["Net ($)"].sum() if "Net ($)" in display_df.columns else 0
-                    cogs = display_df["Sales COGS ($)"].sum() if "Sales COGS ($)" in display_df.columns else 0
-                    totals[c] = net / cogs if cogs != 0 else None
+                    totals[c] = net / full_network_cogs if full_network_cogs != 0 else None
+                elif c == "Sales COGS ($)":
+                    totals[c] = full_network_cogs
                 elif c == "Adjustments":
                     totals[c] = int(display_df[c].sum())
                 else:
@@ -1143,6 +1241,719 @@ def main():
                 st.dataframe(
                     reason_breakdown.style.format(fmt_rb, na_rep="N/A"),
                     use_container_width=True, hide_index=True,
+                )
+
+    # == Tab Compliance Audit ==
+    with tab_compliance:
+        st.caption(
+            "Network-wide reason-code compliance and dollar-amount audit. Matches the "
+            "`Pivot Table2` layout in Lisa's monthly template — Shop × Category in rows, "
+            "Reason in columns, SUM of COGS in cells. **Click a row + column on the "
+            "cross-tab to drill into the underlying transactions** (or use the sortable "
+            "long-format below)."
+        )
+
+        if period_recon.empty:
+            st.info("No reconciliation data for this period.")
+        else:
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                ca_stores = st.multiselect(
+                    "Store",
+                    options=sorted(period_recon["Store"].dropna().unique(), key=store_sort_key),
+                    key="ca_stores",
+                )
+            with fc2:
+                ca_compliance = st.multiselect(
+                    "Compliance",
+                    options=["✅ Approved", "🚫 DNU", "⚠️ Unknown"],
+                    key="ca_compliance",
+                )
+            with fc3:
+                ca_min_cogs = st.number_input(
+                    "Min |COGS| (long-format only)",
+                    min_value=0.0, value=0.0, step=10.0,
+                    key="ca_min_cogs",
+                )
+
+            ca_scope = period_recon.copy()
+            if ca_stores:
+                ca_scope = ca_scope[ca_scope["Store"].isin(ca_stores)]
+
+            rollup = (
+                ca_scope.groupby(["Store", "Category Name", "Reason"], as_index=False)
+                .agg(Adjustments=("COGS", "count"), TRUE_AUDIT_COST=("COGS", "sum"))
+                .rename(columns={"Category Name": "Category"})
+            )
+
+            def _classify_reason(r):
+                if r in APPROVED_REASONS:
+                    return "✅ Approved"
+                if r in DNU_REASONS:
+                    return "🚫 DNU"
+                return "⚠️ Unknown"
+
+            rollup["Compliance"] = rollup["Reason"].apply(_classify_reason)
+            if ca_compliance:
+                rollup = rollup[rollup["Compliance"].isin(ca_compliance)]
+
+            dnu_mask = rollup["Reason"].isin(DNU_REASONS)
+            dnu_rows = int(dnu_mask.sum())
+            dnu_cogs = float(rollup.loc[dnu_mask, "TRUE_AUDIT_COST"].abs().sum())
+            total_rows = len(rollup)
+            distinct_stores = rollup["Store"].nunique()
+
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("🚫 DNU rows", f"{dnu_rows:,}", help=f"${dnu_cogs:,.2f} absolute COGS")
+            with m2:
+                st.metric("Total rows", f"{total_rows:,}")
+            with m3:
+                st.metric("Distinct stores", f"{distinct_stores:,}")
+
+            if rollup.empty:
+                st.info("No rows match the current filters.")
+            else:
+                # Cross-tab (top)
+                st.markdown("---")
+                st.markdown("**Cross-tab — Shop × Category in rows, Reason in columns, SUM of COGS in cells.**")
+
+                xt = pd.pivot_table(
+                    rollup,
+                    index=["Store", "Category"],
+                    columns="Reason",
+                    values="TRUE_AUDIT_COST",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                reason_cols = list(xt.columns)
+                dnu_cols = sorted([r for r in reason_cols if r in DNU_REASONS])
+                appr_cols = sorted([r for r in reason_cols if r in APPROVED_REASONS])
+                unk_cols = sorted([r for r in reason_cols if r not in DNU_REASONS and r not in APPROVED_REASONS])
+                ordered_reasons = dnu_cols + unk_cols + appr_cols
+                xt = xt[ordered_reasons]
+
+                def _col_label(r):
+                    prefix = "🚫 " if r in DNU_REASONS else "✅ " if r in APPROVED_REASONS else "⚠️ "
+                    return f"{prefix}{r}"
+                xt_display = xt.rename(columns={r: _col_label(r) for r in xt.columns})
+                dnu_col_labels = [_col_label(r) for r in dnu_cols]
+
+                def _fmt_cell(v):
+                    if pd.isna(v) or float(v) == 0.0:
+                        return "—"
+                    return f"${v:,.2f}"
+
+                def _style_xt(df):
+                    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                    for c in df.columns:
+                        nonzero = df[c].abs() > 0.0
+                        zero = ~nonzero
+                        is_dnu = c in dnu_col_labels
+                        is_unk = c not in dnu_col_labels and not c.startswith("✅ ")
+                        # Zero cells: muted dash
+                        styles.loc[zero, c] = "color: #cccccc; text-align: right;"
+                        # Non-zero in DNU column: pop red
+                        if is_dnu:
+                            styles.loc[nonzero, c] = "background-color: #ffcccc; color: #800000; font-weight: 700; text-align: right;"
+                        elif is_unk:
+                            styles.loc[nonzero, c] = "background-color: #fff3cd; color: #664d03; font-weight: 700; text-align: right;"
+                        else:
+                            styles.loc[nonzero, c] = "color: #1a3a52; font-weight: 700; text-align: right;"
+                    return styles
+
+                fmt_xt = {c: _fmt_cell for c in xt_display.columns}
+                xt_styled = xt_display.style.format(fmt_xt, na_rep="—").apply(_style_xt, axis=None)
+
+                # Drill from the cross-tab: click a (Store, Category) row + a Reason column
+                # to open the transactions panel below. Single click on each axis = scope.
+                # Click again on the same row/column to deselect.
+                xt_event = st.dataframe(
+                    xt_styled,
+                    use_container_width=True,
+                    height=440,
+                    on_select="rerun",
+                    selection_mode=["single-row", "single-column"],
+                    key="ca_xt_event",
+                )
+
+                xt_sel_rows = []
+                xt_sel_cols = []
+                if xt_event is not None and hasattr(xt_event, "selection"):
+                    xt_sel_rows = list(getattr(xt_event.selection, "rows", []) or [])
+                    xt_sel_cols = list(getattr(xt_event.selection, "columns", []) or [])
+
+                xt_picked_shop = None
+                xt_picked_cat = None
+                xt_picked_reason = None
+                if xt_sel_rows:
+                    idx_label = xt.index[xt_sel_rows[0]]
+                    if isinstance(idx_label, tuple) and len(idx_label) == 2:
+                        xt_picked_shop, xt_picked_cat = idx_label
+                if xt_sel_cols:
+                    col_label = xt_sel_cols[0]
+                    for prefix in ("🚫 ", "✅ ", "⚠️ "):
+                        if col_label.startswith(prefix):
+                            xt_picked_reason = col_label[len(prefix):]
+                            break
+                    else:
+                        xt_picked_reason = col_label
+
+                # Long-format (below)
+                st.markdown("---")
+                st.markdown("**Long-format — same data, sortable + filterable. Sorted by |COGS| descending.**")
+
+                lf = rollup.copy()
+                lf["_abs"] = lf["TRUE_AUDIT_COST"].abs()
+                if ca_min_cogs > 0:
+                    lf = lf[lf["_abs"] >= ca_min_cogs]
+                lf = lf.sort_values("_abs", ascending=False).drop(columns="_abs")
+                lf_cols = ["Compliance", "Store", "Category", "Reason", "Adjustments", "TRUE_AUDIT_COST"]
+                lf_display = lf[lf_cols].rename(columns={"TRUE_AUDIT_COST": "TRUE AUDIT COST"}).reset_index(drop=True)
+
+                def _row_color(row):
+                    if row["Compliance"] == "🚫 DNU":
+                        return ["background-color: #ffcccc"] * len(row)
+                    if row["Compliance"] == "⚠️ Unknown":
+                        return ["background-color: #fff3cd"] * len(row)
+                    return [""] * len(row)
+
+                lf_styled = lf_display.style.format(
+                    {"TRUE AUDIT COST": "${:,.2f}"}
+                ).apply(_row_color, axis=1)
+
+                ca_drill_event = st.dataframe(
+                    lf_styled,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=440,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="ca_lf_drill_event",
+                )
+
+                download_buttons(lf_display, "compliance_audit", "ca_export")
+
+                # ----- Drill panel: view-only transactions for the clicked Shop+Cat+Reason -----
+                # Cross-tab selection takes priority when it fully specifies a cell
+                # (shop + category + reason). Otherwise fall back to long-format row pick.
+                ca_drill_sel = []
+                if ca_drill_event is not None and hasattr(ca_drill_event, "selection"):
+                    ca_drill_sel = list(ca_drill_event.selection.rows or [])
+
+                xt_full_drill = xt_picked_shop and xt_picked_cat and xt_picked_reason
+                ds_shop = ds_cat = ds_rsn = None
+                if xt_full_drill:
+                    ds_shop, ds_cat, ds_rsn = xt_picked_shop, xt_picked_cat, xt_picked_reason
+                elif ca_drill_sel:
+                    sel = lf_display.iloc[ca_drill_sel[0]]
+                    ds_shop, ds_cat, ds_rsn = sel["Store"], sel["Category"], sel["Reason"]
+
+                if ds_shop and ds_cat and ds_rsn:
+                    ca_drill = period_recon[
+                        (period_recon["Store"] == ds_shop)
+                        & (period_recon["Category Name"] == ds_cat)
+                        & (period_recon["Reason"] == ds_rsn)
+                    ].copy()
+                    ca_drill["_abs"] = ca_drill["COGS"].abs()
+                    ca_drill = ca_drill.sort_values("_abs", ascending=False).drop(columns="_abs")
+                    drill_show_cols = [c for c in LISA_DRILL_COLS if c in ca_drill.columns]
+                    st.markdown("---")
+                    tac = ca_drill["COGS"].sum()
+                    st.subheader(
+                        f"Drill: **{ds_shop}** · **{ds_cat}** · **{ds_rsn}** — "
+                        f"{len(ca_drill)} txns, ${tac:,.2f}"
+                    )
+                    st.caption("View-only on this tab. Use the Per-Store Homework tab to flag transactions.")
+                    st.dataframe(_apply_drill_labels(ca_drill[drill_show_cols]), use_container_width=True, hide_index=True, height=420)
+                    download_buttons(_apply_drill_labels(ca_drill[drill_show_cols]), f"audit_drill_{ds_shop}_{ds_cat}_{ds_rsn}", "ca_drill_dl")
+
+    # == Tab Per-Store Homework ==
+    with tab_workbook:
+        st.caption(
+            "Build one store's GM homework. Pick a store → scan the Shrinkage summary → click "
+            "into the Adjustment Breakdown (row = Category, column = Reason, both = cell) → "
+            "flag individual transactions in the drill → download Explanations Needed. "
+            "Switching stores clears the current cart — download first if you want to keep it."
+        )
+
+        period_recon_wb = period_recon.copy() if not period_recon.empty else pd.DataFrame()
+
+        if period_recon_wb.empty:
+            st.info("No reconciliation data for this period.")
+        else:
+            def _txn_id_wb(row):
+                return f"{row.get('Reconciliation No')}|{row.get('Batch SKU')}|{row.get('Difference')}|{row.get('COGS')}"
+            period_recon_wb["_txn_id"] = period_recon_wb.apply(_txn_id_wb, axis=1)
+
+            for k, default in [
+                ("homework_cart", set()),
+                ("homework_cart_store", None),
+                ("lw_pivot_event_version", 0),
+                ("lw_drill_event_version", 0),
+                ("lw_cart_event_version", 0),
+            ]:
+                if k not in st.session_state:
+                    st.session_state[k] = default
+
+            if "Category" in period_sales.columns:
+                cat_sales_wb = period_sales.groupby(["Store", "Category"], as_index=False)["Sales COGS"].sum()
+            elif "Product Category" in period_sales.columns:
+                cat_sales_wb = (
+                    period_sales.groupby(["Store", "Product Category"], as_index=False)["Sales COGS"].sum()
+                    .rename(columns={"Product Category": "Category"})
+                )
+            else:
+                cat_sales_wb = pd.DataFrame(columns=["Store", "Category", "Sales COGS"])
+
+            def _color_breach_wb(val):
+                if pd.isna(val):
+                    return ""
+                if abs(val) > 0.02:
+                    return "background-color: #ffcccc"
+                return ""
+
+            def _classify_reason_wb(r):
+                if r in APPROVED_REASONS:
+                    return "✅ Approved"
+                if r in DNU_REASONS:
+                    return "🚫 DNU"
+                return "⚠️ Unknown"
+
+            # ----- Store picker -----
+            available_stores = [s for s in STORE_ORDER if s in period_recon_wb["Store"].unique()]
+            picker_options = ["— pick a store —"] + available_stores
+            picked = st.selectbox(
+                "Pick a store",
+                options=picker_options,
+                key="lw_store_picker",
+            )
+            selected_store = None if picked == "— pick a store —" else picked
+
+            # Cart-clears-on-switch: if the store selection changed, clear the cart.
+            prev_store = st.session_state["homework_cart_store"]
+            if selected_store != prev_store:
+                if st.session_state["homework_cart"]:
+                    st.session_state["homework_cart"] = set()
+                    st.session_state["lw_pivot_event_version"] += 1
+                    st.session_state["lw_drill_event_version"] += 1
+                    st.session_state["lw_cart_event_version"] += 1
+                st.session_state["homework_cart_store"] = selected_store
+
+            if selected_store is None:
+                st.info("👈 Pick a store above to start the drill flow.")
+            else:
+                shop_full = next(
+                    (k for k, v in STORE_NAME_MAP.items() if v == selected_store),
+                    selected_store,
+                )
+                store_recon = period_recon_wb[period_recon_wb["Store"] == selected_store]
+
+                # ----- Shrinkage summary (matches her workbook's Shrinkage tab) -----
+                st.markdown("---")
+                st.subheader(f"Shrinkage summary — {selected_store}")
+                st.caption("Per-Category OVERSOLD + UNDERSOLD vs Sales COGS. Categories breaching 2% highlighted.")
+
+                shrink_recon = store_recon[store_recon["Reason"].isin(["OVERSOLD", "UNDERSOLD"])]
+                # Build the universe of categories from BOTH sales and shrinkage so that
+                # categories with sales but zero shrinkage still appear as 0/0 — Lisa needs
+                # those rows present so the Total reconciles to per-store Sales COGS.
+                store_sales_cats = set()
+                if not cat_sales_wb.empty:
+                    store_sales_cats = set(
+                        cat_sales_wb.loc[cat_sales_wb["Store"] == selected_store, "Category"].dropna().unique()
+                    )
+                shrink_cats = set(shrink_recon["Category Name"].dropna().unique()) if not shrink_recon.empty else set()
+                all_cats = sorted(store_sales_cats | shrink_cats)
+
+                if not all_cats:
+                    st.info("No categories with sales or shrinkage for this store in this period.")
+                    shrink_summary_df = pd.DataFrame()
+                else:
+                    summary_rows = []
+                    for cat in all_cats:
+                        cat_data = shrink_recon[shrink_recon["Category Name"] == cat] if not shrink_recon.empty else pd.DataFrame()
+                        oversold = cat_data[cat_data["Reason"] == "OVERSOLD"]["COGS"].sum() if not cat_data.empty else 0
+                        undersold = cat_data[cat_data["Reason"] == "UNDERSOLD"]["COGS"].sum() if not cat_data.empty else 0
+                        tac = oversold + undersold
+                        ccogs = cat_sales_wb[
+                            (cat_sales_wb["Store"] == selected_store)
+                            & (cat_sales_wb["Category"] == cat)
+                        ]["Sales COGS"].sum() if "Sales COGS" in cat_sales_wb.columns else 0
+                        summary_rows.append({
+                            "Category Name": cat,
+                            "SUM of OVERSOLD": oversold,
+                            "SUM of UNDERSOLD": undersold,
+                            "SUM of TRUE AUDIT COST": tac,
+                            "SUM of COGS": ccogs,
+                            "%": tac / ccogs if ccogs else None,
+                        })
+                    s_oversold = shrink_recon[shrink_recon["Reason"] == "OVERSOLD"]["COGS"].sum()
+                    s_undersold = shrink_recon[shrink_recon["Reason"] == "UNDERSOLD"]["COGS"].sum()
+                    s_tac = s_oversold + s_undersold
+                    s_cogs = sales_by_store[
+                        sales_by_store["Store"] == selected_store
+                    ]["Store Sales COGS"].sum() if not sales_by_store.empty else 0
+                    summary_rows.append({
+                        "Category Name": "Total",
+                        "SUM of OVERSOLD": s_oversold,
+                        "SUM of UNDERSOLD": s_undersold,
+                        "SUM of TRUE AUDIT COST": s_tac,
+                        "SUM of COGS": s_cogs,
+                        "%": s_tac / s_cogs if s_cogs else None,
+                    })
+                    shrink_summary_df = pd.DataFrame(summary_rows)
+                    summary_styled = shrink_summary_df.style.format({
+                        "SUM of OVERSOLD": "${:,.2f}",
+                        "SUM of UNDERSOLD": "${:,.2f}",
+                        "SUM of TRUE AUDIT COST": "${:,.2f}",
+                        "SUM of COGS": "${:,.2f}",
+                        "%": "{:.2%}",
+                    }, na_rep="").map(_color_breach_wb, subset=["%"])
+                    st.dataframe(summary_styled, use_container_width=True, hide_index=True, height=380)
+
+                # ----- Adjustment Breakdown (drill anchor) -----
+                st.markdown("---")
+                st.subheader(f"Adjustment Breakdown — {selected_store}")
+                st.caption(
+                    "Categories in rows, Reasons in columns. SUM of COGS in cells with Grand "
+                    "Total row + column. Click a row to scope the drill by Category, click a "
+                    "column header to scope by Reason, click both to drill into a single cell. "
+                    "Click again to deselect."
+                )
+
+                xt3 = pd.pivot_table(
+                    store_recon,
+                    index="Category Name",
+                    columns="Reason",
+                    values="COGS",
+                    aggfunc="sum",
+                    fill_value=0,
+                    margins=True,
+                    margins_name="Grand Total",
+                )
+                reason_cols_present = [c for c in xt3.columns if c != "Grand Total"]
+                xt3_dnu_cols = sorted([r for r in reason_cols_present if r in DNU_REASONS])
+                xt3_appr_cols = sorted([r for r in reason_cols_present if r in APPROVED_REASONS])
+                xt3_unk_cols = sorted([r for r in reason_cols_present if r not in DNU_REASONS and r not in APPROVED_REASONS])
+                xt3_ordered = xt3_dnu_cols + xt3_unk_cols + xt3_appr_cols + ["Grand Total"]
+                xt3 = xt3[xt3_ordered]
+
+                def _xt3_label(r):
+                    if r == "Grand Total":
+                        return r
+                    prefix = "🚫 " if r in DNU_REASONS else "✅ " if r in APPROVED_REASONS else "⚠️ "
+                    return f"{prefix}{r}"
+                xt3_display = xt3.rename(columns={r: _xt3_label(r) for r in xt3.columns})
+                xt3_dnu_labels = [_xt3_label(r) for r in xt3_dnu_cols]
+                xt3_unk_labels = [_xt3_label(r) for r in xt3_unk_cols]
+
+                def _xt3_fmt(v):
+                    if pd.isna(v) or float(v) == 0.0:
+                        return "—"
+                    return f"${v:,.2f}"
+
+                def _xt3_style(df):
+                    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                    for c in df.columns:
+                        nonzero = df[c].abs() > 0.0
+                        zero = ~nonzero
+                        styles.loc[zero, c] = "color: #cccccc; text-align: right;"
+                        if c in xt3_dnu_labels:
+                            styles.loc[nonzero, c] = "background-color: #ffcccc; color: #800000; font-weight: 700; text-align: right;"
+                        elif c in xt3_unk_labels:
+                            styles.loc[nonzero, c] = "background-color: #fff3cd; color: #664d03; font-weight: 700; text-align: right;"
+                        elif c == "Grand Total":
+                            styles.loc[nonzero, c] = "color: #1a1a1a; font-weight: 700; background-color: #f0f0f0; text-align: right;"
+                        else:
+                            styles.loc[nonzero, c] = "color: #1a3a52; font-weight: 700; text-align: right;"
+                    if "Grand Total" in df.index:
+                        for c in df.columns:
+                            base = styles.loc["Grand Total", c]
+                            styles.loc["Grand Total", c] = (base + "; background-color: #f0f0f0; font-weight: 700;").lstrip("; ")
+                    return styles
+
+                fmt_xt3 = {c: _xt3_fmt for c in xt3_display.columns}
+                xt3_styled = xt3_display.style.format(fmt_xt3, na_rep="—").apply(_xt3_style, axis=None)
+
+                xt3_key = f"lw_xt3_event_v{st.session_state['lw_pivot_event_version']}_{selected_store}"
+                xt3_event = st.dataframe(
+                    xt3_styled,
+                    use_container_width=True,
+                    height=440,
+                    on_select="rerun",
+                    selection_mode=["single-row", "single-column"],
+                    key=xt3_key,
+                )
+
+                # Decode row + column selection from the cross-tab
+                xt3_sel_rows = []
+                xt3_sel_cols = []
+                if xt3_event is not None and hasattr(xt3_event, "selection"):
+                    xt3_sel_rows = list(getattr(xt3_event.selection, "rows", []) or [])
+                    xt3_sel_cols = list(getattr(xt3_event.selection, "columns", []) or [])
+
+                xt3_selected_cat = None
+                xt3_selected_reason = None
+                if xt3_sel_rows:
+                    label = xt3_display.index[xt3_sel_rows[0]]
+                    if label != "Grand Total":
+                        xt3_selected_cat = label
+                if xt3_sel_cols:
+                    col_label = xt3_sel_cols[0]
+                    if col_label != "Grand Total":
+                        for prefix in ("🚫 ", "✅ ", "⚠️ "):
+                            if col_label.startswith(prefix):
+                                xt3_selected_reason = col_label[len(prefix):]
+                                break
+                        else:
+                            xt3_selected_reason = col_label
+
+                # Push cross-tab selection into the drill filters (lets Lisa override after).
+                # Fix 5/19 (Bug 1): cross-tab selection now ADDS to the existing filter set
+                # rather than REPLACING it. And when the cross-tab deselects (None), we leave
+                # the user's filter alone instead of wiping it. Lisa expects the multiselect
+                # to retain her picks even after she scopes from the cross-tab.
+                cat_filter_key = f"lw_drill_cat_filter_{selected_store}"
+                rsn_filter_key = f"lw_drill_reason_filter_{selected_store}"
+                applied_sel_key = f"lw_xt_applied_sel_{selected_store}"
+                current_xt_sel = (xt3_selected_cat, xt3_selected_reason)
+                prev_applied = st.session_state.get(applied_sel_key)
+                if current_xt_sel != prev_applied:
+                    if xt3_selected_cat:
+                        existing_cats = list(st.session_state.get(cat_filter_key, []) or [])
+                        if xt3_selected_cat not in existing_cats:
+                            existing_cats.append(xt3_selected_cat)
+                        st.session_state[cat_filter_key] = existing_cats
+                    if xt3_selected_reason:
+                        existing_rsns = list(st.session_state.get(rsn_filter_key, []) or [])
+                        if xt3_selected_reason not in existing_rsns:
+                            existing_rsns.append(xt3_selected_reason)
+                        st.session_state[rsn_filter_key] = existing_rsns
+                    st.session_state[applied_sel_key] = current_xt_sel
+
+                # ----- Drill panel -----
+                st.markdown("---")
+                st.subheader("Drill — flag transactions for the homework")
+                st.caption(
+                    "All reconciliations for this store. Pre-sorted by absolute COGS so the largest "
+                    "amounts surface first. Each row carries its own Reason — flag any transaction, "
+                    "not just OVERSOLD/UNDERSOLD shrinkage. Click on Adjustment Breakdown above to "
+                    "scope automatically, or use the manual filters."
+                )
+
+                # "Store" is constant in this view, drop from the visible drill columns
+                drill_cols = [c for c in LISA_DRILL_COLS if c in store_recon.columns and c != "Store"]
+                missing_cols = [c for c in LISA_DRILL_COLS if c not in store_recon.columns and c != "Store"]
+                if missing_cols:
+                    st.caption(f"_Columns not in current data (re-upload to populate): {', '.join(missing_cols)}_")
+
+                cat_options = sorted(store_recon["Category Name"].dropna().unique())
+                reason_options = sorted(store_recon["Reason"].dropna().unique())
+                fc1, fc2, fc3 = st.columns([2, 2, 1])
+                with fc1:
+                    drill_cat_filter = st.multiselect(
+                        "Category filter",
+                        options=cat_options,
+                        key=cat_filter_key,
+                        help="Empty = all categories",
+                    )
+                with fc2:
+                    drill_reason_filter = st.multiselect(
+                        "Reason filter",
+                        options=reason_options,
+                        key=rsn_filter_key,
+                        help="Empty = all reasons",
+                    )
+                with fc3:
+                    drill_dnu_only = st.checkbox(
+                        "DNU only",
+                        value=False,
+                        key=f"lw_drill_dnu_{selected_store}",
+                    )
+
+                drill_scope = store_recon.copy()
+                if drill_cat_filter:
+                    drill_scope = drill_scope[drill_scope["Category Name"].isin(drill_cat_filter)]
+                if drill_reason_filter:
+                    drill_scope = drill_scope[drill_scope["Reason"].isin(drill_reason_filter)]
+                if drill_dnu_only:
+                    drill_scope = drill_scope[drill_scope["Reason"].isin(DNU_REASONS)]
+
+                drill_scope = drill_scope.copy()
+                drill_scope["_abs_cogs"] = drill_scope["COGS"].abs()
+                drill_scope = drill_scope.sort_values("_abs_cogs", ascending=False).drop(columns="_abs_cogs")
+
+                cart_set_view = st.session_state["homework_cart"]
+                drill_scope["✓"] = drill_scope["_txn_id"].apply(lambda t: "✓" if t in cart_set_view else "")
+                drill_display = drill_scope[["✓"] + drill_cols + ["_txn_id"]].reset_index(drop=True)
+
+                # Key includes filter signature: when filter changes the row positions change too,
+                # so we must reset selection state to avoid the multi-row select pointing at wrong rows.
+                filter_sig = (
+                    f"{tuple(sorted(drill_cat_filter))}_"
+                    f"{tuple(sorted(drill_reason_filter))}_{drill_dnu_only}"
+                )
+                drill_key = (
+                    f"lw_drill_event_v{st.session_state['lw_drill_event_version']}_"
+                    f"{selected_store}_{filter_sig}"
+                )
+                drill_tac_total = drill_scope["COGS"].sum()
+                drill_flagged_in_view = int(drill_scope["✓"].eq("✓").sum())
+                st.markdown(
+                    f"**{len(drill_scope):,} transaction(s) visible** — sum COGS "
+                    f"${drill_tac_total:,.2f} · {drill_flagged_in_view} already in cart"
+                )
+                drill_event = st.dataframe(
+                    _apply_drill_labels(drill_display.drop(columns="_txn_id")),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    on_select="rerun",
+                    selection_mode="multi-row",
+                    key=drill_key,
+                )
+
+                drill_sel = []
+                if drill_event is not None and hasattr(drill_event, "selection"):
+                    drill_sel = list(drill_event.selection.rows or [])
+                drill_sel_txn_ids = (
+                    [drill_display.iloc[i]["_txn_id"] for i in drill_sel] if drill_sel else []
+                )
+
+                add_col, info_col = st.columns([1, 3])
+                with add_col:
+                    if st.button(
+                        f"➕ Add {len(drill_sel_txn_ids)} to Explanations Needed",
+                        disabled=not drill_sel_txn_ids,
+                        type="primary",
+                        key="lw_add_btn",
+                    ):
+                        st.session_state["homework_cart"] = (
+                            st.session_state["homework_cart"] | set(drill_sel_txn_ids)
+                        )
+                        st.session_state["lw_drill_event_version"] += 1
+                        st.rerun()
+                with info_col:
+                    if not drill_sel_txn_ids:
+                        st.caption("_Click a row, or shift/Cmd-click for multi-select._")
+
+                # ----- Explanations Needed cart -----
+                st.markdown("---")
+                st.subheader(f"Explanations Needed cart — {selected_store}")
+
+                cart_set = st.session_state["homework_cart"]
+                cart_rows = store_recon[store_recon["_txn_id"].isin(cart_set)]
+                cart_count = len(cart_rows)
+                cart_tac_abs = float(cart_rows["COGS"].abs().sum())
+
+                if cart_count == 0:
+                    st.info("No transactions in the cart yet. Click a row in the Adjustment Breakdown, then add transactions in the drill panel. You can still download the Shrinkage summary below.")
+                    cart_sorted = pd.DataFrame(columns=store_recon.columns)
+                    drill_cols_for_cart = [c for c in LISA_DRILL_COLS if c in store_recon.columns]
+                else:
+                    st.markdown(
+                        f"**{cart_count} transaction(s)** flagged for **{selected_store}** — "
+                        f"total |TAC| **${cart_tac_abs:,.2f}**"
+                    )
+                    cart_rollup = cart_rows.groupby(["Category Name", "Reason"]).agg(
+                        Flagged=("COGS", "count"),
+                        TAC=("COGS", "sum"),
+                    ).reset_index().rename(columns={
+                        "Category Name": "Category",
+                        "TAC": "TRUE AUDIT COST",
+                    })
+                    cart_rollup["Compliance"] = cart_rollup["Reason"].apply(_classify_reason_wb)
+                    cart_rollup = cart_rollup[["Category", "Reason", "Compliance", "Flagged", "TRUE AUDIT COST"]]
+                    st.dataframe(
+                        cart_rollup.style.format({"TRUE AUDIT COST": "${:,.2f}"}),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                    drill_cols_for_cart = [c for c in LISA_DRILL_COLS if c in cart_rows.columns]
+                    cart_sorted = cart_rows.copy()
+                    cart_sorted["_abs_cogs"] = cart_sorted["COGS"].abs()
+                    cart_sorted = cart_sorted.sort_values("_abs_cogs", ascending=False).drop(columns="_abs_cogs")
+                    with st.expander("View / remove flagged transactions"):
+                        cart_view = cart_sorted[drill_cols_for_cart + ["_txn_id"]].reset_index(drop=True)
+
+                        cart_key = f"lw_cart_event_v{st.session_state['lw_cart_event_version']}_{selected_store}"
+                        cart_event = st.dataframe(
+                            _apply_drill_labels(cart_view.drop(columns="_txn_id")),
+                            use_container_width=True,
+                            hide_index=True,
+                            height=320,
+                            on_select="rerun",
+                            selection_mode="multi-row",
+                            key=cart_key,
+                        )
+
+                        rm_sel = []
+                        if cart_event is not None and hasattr(cart_event, "selection"):
+                            rm_sel = list(cart_event.selection.rows or [])
+                        rm_txn_ids = (
+                            [cart_view.iloc[i]["_txn_id"] for i in rm_sel] if rm_sel else []
+                        )
+                        rmc1, rmc2 = st.columns([1, 1])
+                        with rmc1:
+                            if st.button(
+                                f"➖ Remove {len(rm_txn_ids)} from cart",
+                                disabled=not rm_txn_ids,
+                                key="lw_remove_btn",
+                            ):
+                                st.session_state["homework_cart"] = (
+                                    st.session_state["homework_cart"] - set(rm_txn_ids)
+                                )
+                                st.session_state["lw_cart_event_version"] += 1
+                                st.rerun()
+                        with rmc2:
+                            if st.button(
+                                f"🗑️ Clear {selected_store} cart",
+                                key="lw_clear_btn",
+                            ):
+                                st.session_state["homework_cart"] = set()
+                                st.session_state["lw_pivot_event_version"] += 1
+                                st.session_state["lw_drill_event_version"] += 1
+                                st.session_state["lw_cart_event_version"] += 1
+                                st.rerun()
+
+                # ----- Download per-store homework (always available once a store is picked) -----
+                st.markdown("---")
+                sheets = {}
+                # Shrinkage tab: always include, even when no categories breach. Lisa wants
+                # the per-category summary in every download for the GM packet.
+                if not shrink_summary_df.empty:
+                    sheets["Shrinkage"] = shrink_summary_df.copy()
+                else:
+                    sheets["Shrinkage"] = pd.DataFrame(
+                        columns=["Category Name", "SUM of OVERSOLD", "SUM of UNDERSOLD",
+                                 "SUM of TRUE AUDIT COST", "SUM of COGS", "%"]
+                    )
+
+                # Explanations needed tab: rename Batch SKU → Blaze Batch for clarity, add GM column.
+                if cart_count > 0:
+                    cart_export = _apply_drill_labels(cart_sorted[drill_cols_for_cart].copy())
+                else:
+                    cart_export = pd.DataFrame(
+                        columns=[DRILL_DISPLAY_LABELS.get(c, c) for c in drill_cols_for_cart]
+                    )
+                cart_export["GM Explanation"] = ""
+                sheets["Explanations needed"] = cart_export
+
+                buf = make_excel_download(sheets)
+                period_tag = selected_period or "all"
+                safe_store = selected_store.replace(" ", "_").replace("/", "-")
+                st.download_button(
+                    f"📥 Download {selected_store} Homework",
+                    data=buf,
+                    file_name=f"homework_{safe_store}_{period_tag}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key="lw_homework_dl",
+                )
+                st.caption(
+                    f"Workbook: 'Shrinkage' tab (per-category OVERSOLD/UNDERSOLD for {selected_store}) "
+                    f"+ 'Explanations needed' tab ({cart_count} flagged transaction(s) + GM Explanation column)."
                 )
 
     # == Tab 3: Legacy Shrink ==
@@ -1237,15 +2048,75 @@ def main():
         st.metric("Network Total", f"${dde_net:,.2f} ({dde_count} adjustments)")
         st.caption("Billed to vendor")
 
-        # Break out DDE sub-groups
-        for sub_name, sub_reasons in DDE_SUBGROUPS.items():
+        # Sub-group totals as a row of metrics
+        sub_cols_row = st.columns(len(DDE_SUBGROUPS))
+        for (sub_name, sub_reasons), col in zip(DDE_SUBGROUPS.items(), sub_cols_row):
             sub_filtered = period_recon[period_recon["Reason"].isin(sub_reasons)] if not period_recon.empty else pd.DataFrame()
-            if not sub_filtered.empty:
-                sub_net = sub_filtered["COGS"].sum()
-                st.markdown(f"**{sub_name}**: ${sub_net:,.2f} ({len(sub_filtered)} adjustments)")
+            sub_net = sub_filtered["COGS"].sum() if not sub_filtered.empty else 0
+            sub_count = len(sub_filtered)
+            with col:
+                st.metric(sub_name, f"${sub_net:,.2f}", help=f"{sub_count} adjustments")
 
-        # DDE by store
-        render_group_table(period_recon, sales_by_store, REASON_GROUPS["DDE"], "DDE by Store", "dde")
+        # Per-store table broken out by Display / Defective / Expired
+        dde_filtered = period_recon[period_recon["Reason"].isin(REASON_GROUPS["DDE"])] if not period_recon.empty else pd.DataFrame()
+        if dde_filtered.empty:
+            st.caption("No DDE adjustments this period.")
+        else:
+            sub_map = {r: sub for sub, rs in DDE_SUBGROUPS.items() for r in rs}
+            dde_filtered = dde_filtered.copy()
+            dde_filtered["_subgroup"] = dde_filtered["Reason"].map(sub_map)
+            dde_by_store = (
+                dde_filtered.groupby(["Store", "_subgroup"], as_index=False)["COGS"].sum()
+                .pivot(index="Store", columns="_subgroup", values="COGS")
+                .fillna(0)
+                .reset_index()
+            )
+            for sub in DDE_SUBGROUPS.keys():
+                if sub not in dde_by_store.columns:
+                    dde_by_store[sub] = 0.0
+            dde_by_store["DDE Total"] = dde_by_store[list(DDE_SUBGROUPS.keys())].sum(axis=1)
+            dde_by_store = dde_by_store.merge(sales_by_store, on="Store", how="left")
+            dde_by_store["% of COGS"] = dde_by_store.apply(
+                lambda r: r["DDE Total"] / r["Store Sales COGS"]
+                if pd.notna(r.get("Store Sales COGS")) and r.get("Store Sales COGS", 0) != 0
+                else None,
+                axis=1,
+            )
+            dde_by_store["_s"] = dde_by_store["Store"].map(store_sort_key)
+            dde_by_store = dde_by_store.sort_values("_s").drop(columns="_s")
+
+            sub_list = list(DDE_SUBGROUPS.keys())
+            dde_cols = ["Store"] + sub_list + ["DDE Total", "Store Sales COGS", "% of COGS"]
+            dde_display = dde_by_store[[c for c in dde_cols if c in dde_by_store.columns]].copy()
+
+            # Grand total row — full network COGS denominator (zero-DDE stores stay in)
+            full_cogs = sales_by_store["Store Sales COGS"].sum() if not sales_by_store.empty else 0
+            totals = {"Store": "NETWORK TOTAL"}
+            for c in dde_display.columns:
+                if c == "Store":
+                    continue
+                if c == "Store Sales COGS":
+                    totals[c] = full_cogs
+                elif c == "% of COGS":
+                    net = dde_display["DDE Total"].sum() if "DDE Total" in dde_display.columns else 0
+                    totals[c] = net / full_cogs if full_cogs != 0 else None
+                else:
+                    totals[c] = dde_display[c].sum()
+            dde_with_total = pd.concat([dde_display, pd.DataFrame([totals])], ignore_index=True)
+
+            fmt_dde = {
+                "Display": "${:,.2f}",
+                "Defective": "${:,.2f}",
+                "Expired": "${:,.2f}",
+                "DDE Total": "${:,.2f}",
+                "Store Sales COGS": "${:,.2f}",
+                "% of COGS": "{:.2%}",
+            }
+            styled_dde = dde_with_total.style.format(
+                {k: v for k, v in fmt_dde.items() if k in dde_with_total.columns}, na_rep="N/A"
+            )
+            st.dataframe(styled_dde, use_container_width=True, hide_index=True)
+            download_buttons(dde_with_total, "dde_by_store", "dde")
 
         st.markdown("---")
         render_group_table(period_recon, sales_by_store, REASON_GROUPS["Samples"], "Samples", "samp")
