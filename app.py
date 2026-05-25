@@ -11,6 +11,11 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.7 (2026-05-25)
+- Per-Store Homework drill table: cart-membership ✓ column removed. The
+  "already in cart" count above the table is the cart-membership signal;
+  the leftmost native streamlit selection checkboxes are the only
+  checkmarks in the table.
 v2.6.6 (2026-05-25)
 - Reason Code Audit tab restructured. Long-format table + Min |COGS|
   filter removed. Cross-tab now supports multi-row + multi-column
@@ -162,7 +167,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.6"
+VERSION = "2.6.7"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -2058,15 +2063,10 @@ def main():
                     help="Tick to flag every row in the current filtered view at once.",
                 )
 
-                # ✓ column reflects ONLY cart membership (not select-all). Streamlit's
-                # st.dataframe multi-row selection is user-click-only. there's no API
-                # to programmatically set row-selection state, so we don't fake it.
-                # The Select-all-visible checkbox below controls what the Add button
-                # adds, but row-level checkmarks in the table are user-driven only.
-                drill_scope["✓"] = drill_scope["_txn_id"].apply(
-                    lambda t: "✓" if t in cart_set_view else ""
-                )
-                drill_display = drill_scope[["✓"] + drill_cols + ["_txn_id"]].reset_index(drop=True)
+                # No custom ✓ column. Cart membership shown via "already in cart"
+                # count above; the native streamlit selection checkboxes on the
+                # left of the dataframe are the only checkmarks in the table.
+                drill_display = drill_scope[drill_cols + ["_txn_id"]].reset_index(drop=True)
 
                 drill_key = (
                     f"lw_drill_event_v{st.session_state['lw_drill_event_version']}_"
