@@ -11,6 +11,19 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.3 (2026-05-25)
+- Per-Store Adjustment Breakdown: multi-select (multi-row + multi-column) on
+  the cross-tab. Cmd / shift-click to extend selection. Filter below now
+  mirrors the cross-tab selection exactly (replaces, no more orphan filter
+  entries left behind when the cross-tab visual deselects). Manual edits to
+  the bottom multiselect filters still persist between cross-tab clicks.
+- Per-Store Adjustment Breakdown column order: Category, %, Grand Total,
+  Reasons (DNU first then Unknown then Approved), Sales COGS.
+- New: "Create as Google Sheet" button next to the xlsx download. Creates a
+  live Google Sheet (same two tabs, same formatting) and auto-shares with
+  Charles. Lisa can then share the sheet link with the GM, who types
+  explanations directly into the GM Explanation column. Last-created sheet
+  URL is shown until a new one is created.
 v2.6.2 (2026-05-25)
 - Per-Store Homework: Shrinkage summary and Adjustment Breakdown merged into
   one table. Sales COGS and shrinkage % columns appended to the right of the
@@ -104,7 +117,11 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
+
+# Email of the human owner of this app — used to auto-share newly-created
+# homework Google Sheets so Charles can see them in his Drive.
+USER_EMAIL = "charles@myhavenstores.com"
 
 st.set_page_config(
     page_title=f"Shrinkage Dashboard v{VERSION}",
@@ -349,6 +366,103 @@ def make_excel_download(dataframes_dict):
             df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     buf.seek(0)
     return buf
+
+
+def _col_letter(n):
+    """Convert 1-indexed column number to Excel/Sheets letter (1=A, 27=AA)."""
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def make_homework_gsheet(sheets_dict, title, share_with=None):
+    """Upload the homework workbook to a new Google Sheet and return the URL.
+
+    sheets_dict: {sheet_name: DataFrame} — same shape as the xlsx writer.
+    title: Sheet title (will get a timestamp suffix).
+    share_with: list of email addresses to grant writer access to (notify=False).
+
+    Returns the spreadsheet URL string. Raises if Google Sheets isn't configured.
+    """
+    if not has_sheets_config():
+        raise RuntimeError("Google Sheets is not configured for this app.")
+
+    gc = get_gspread_client()
+    ts = datetime.now().strftime("%Y-%m-%d %H%M")
+    full_title = f"{title} ({ts})"
+    sh = gc.create(full_title)
+
+    # Share with the requested emails so users can open + edit. Service account
+    # remains the owner (counts against its Drive quota).
+    for email in (share_with or []):
+        try:
+            sh.share(email, perm_type="user", role="writer", notify=False)
+        except Exception:
+            pass  # share failures are non-fatal; URL still works for service account
+
+    DOLLAR_FMT = {"numberFormat": {"type": "CURRENCY", "pattern": "$#,##0.00"}}
+    PCT_FMT = {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}
+    QTY_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
+    HEADER_FMT = {"textFormat": {"bold": True}, "horizontalAlignment": "LEFT"}
+
+    default_ws = sh.sheet1
+    sheet_names = list(sheets_dict.keys())
+
+    for idx, sheet_name in enumerate(sheet_names):
+        df = sheets_dict[sheet_name]
+        rows_needed = max(len(df) + 5, 20)
+        cols_needed = max(len(df.columns) + 1, 10)
+        if idx == 0:
+            default_ws.update_title(sheet_name[:100])
+            ws = default_ws
+            ws.resize(rows=rows_needed, cols=cols_needed)
+        else:
+            ws = sh.add_worksheet(title=sheet_name[:100], rows=rows_needed, cols=cols_needed)
+
+        # Build value matrix: headers + rows. Convert NaN to empty string;
+        # keep numbers as floats so the numberFormat applies.
+        header_row = [str(c) for c in df.columns]
+        data_rows = []
+        for _, row in df.iterrows():
+            row_vals = []
+            for v in row:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    row_vals.append("")
+                elif isinstance(v, (int, float)):
+                    row_vals.append(float(v))
+                else:
+                    row_vals.append(str(v))
+            data_rows.append(row_vals)
+        values = [header_row] + data_rows
+        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+
+        last_col = _col_letter(len(df.columns))
+        last_row = len(df) + 1  # +1 for header row
+
+        # Header formatting
+        ws.format(f"A1:{last_col}1", HEADER_FMT)
+
+        # Per-sheet number formats
+        if sheet_name == "Shrinkage":
+            # B-E currency (OVERSOLD / UNDERSOLD / TAC / Sales COGS); F percent
+            for col_idx, h in enumerate(df.columns, start=1):
+                letter = _col_letter(col_idx)
+                if h in ("SUM of OVERSOLD", "SUM of UNDERSOLD",
+                         "SUM of TRUE AUDIT COST", "SUM of COGS"):
+                    ws.format(f"{letter}2:{letter}{last_row}", DOLLAR_FMT)
+                elif h == "%":
+                    ws.format(f"{letter}2:{letter}{last_row}", PCT_FMT)
+        elif sheet_name == "Explanations needed":
+            for col_idx, h in enumerate(df.columns, start=1):
+                letter = _col_letter(col_idx)
+                if h in ("COGS", "Cost per Unit"):
+                    ws.format(f"{letter}2:{letter}{last_row}", DOLLAR_FMT)
+                elif h == "Difference":
+                    ws.format(f"{letter}2:{letter}{last_row}", QTY_FMT)
+
+    return sh.url
 
 
 # ============================================================================
@@ -1649,10 +1763,8 @@ def main():
                 xt3_dnu_cols = sorted([r for r in reason_cols_present if r in DNU_REASONS])
                 xt3_appr_cols = sorted([r for r in reason_cols_present if r in APPROVED_REASONS])
                 xt3_unk_cols = sorted([r for r in reason_cols_present if r not in DNU_REASONS and r not in APPROVED_REASONS])
-                xt3_ordered = xt3_dnu_cols + xt3_unk_cols + xt3_appr_cols + (["Grand Total"] if "Grand Total" in xt3.columns else [])
-                xt3 = xt3[xt3_ordered]
 
-                # Append Sales COGS + % columns
+                # Append Sales COGS first (used in % calc), then % column
                 sales_cogs_series = pd.Series(
                     {cat: float(sales_cogs_by_cat.get(cat, 0)) for cat in xt3.index if cat != "Grand Total"},
                     dtype=float,
@@ -1669,6 +1781,14 @@ def main():
                 else:
                     pct_series = pd.Series(pd.NA, index=xt3.index, dtype="object")
                 xt3["%"] = pct_series
+
+                # Final column order: Category (index) | % | Grand Total | Reasons (DNU, Unknown, Approved) | Sales COGS
+                final_order = ["%"]
+                if "Grand Total" in xt3.columns:
+                    final_order.append("Grand Total")
+                final_order += xt3_dnu_cols + xt3_unk_cols + xt3_appr_cols
+                final_order.append("Sales COGS")
+                xt3 = xt3[final_order]
 
                 def _xt3_label(r):
                     if r in ("Grand Total", "Sales COGS", "%"):
@@ -1728,54 +1848,53 @@ def main():
                     use_container_width=True,
                     height=440,
                     on_select="rerun",
-                    selection_mode=["single-row", "single-column"],
+                    selection_mode=["multi-row", "multi-column"],
                     key=xt3_key,
                 )
 
-                # Decode row + column selection from the cross-tab
+                # Decode multi-row + multi-column selection from the cross-tab.
+                # Each click extends the selection; cmd/shift-click works natively.
+                # Grand Total row + non-reason columns (%, Grand Total, Sales COGS) are
+                # ignored for filter-scoping purposes.
                 xt3_sel_rows = []
                 xt3_sel_cols = []
                 if xt3_event is not None and hasattr(xt3_event, "selection"):
                     xt3_sel_rows = list(getattr(xt3_event.selection, "rows", []) or [])
                     xt3_sel_cols = list(getattr(xt3_event.selection, "columns", []) or [])
 
-                xt3_selected_cat = None
-                xt3_selected_reason = None
-                if xt3_sel_rows:
-                    label = xt3_display.index[xt3_sel_rows[0]]
-                    if label != "Grand Total":
-                        xt3_selected_cat = label
-                if xt3_sel_cols:
-                    col_label = xt3_sel_cols[0]
-                    if col_label != "Grand Total":
-                        for prefix in ("🚫 ", "✅ ", "⚠️ "):
-                            if col_label.startswith(prefix):
-                                xt3_selected_reason = col_label[len(prefix):]
-                                break
-                        else:
-                            xt3_selected_reason = col_label
+                xt3_selected_cats = []
+                for r_idx in xt3_sel_rows:
+                    if 0 <= r_idx < len(xt3_display.index):
+                        label = xt3_display.index[r_idx]
+                        if label != "Grand Total":
+                            xt3_selected_cats.append(label)
 
-                # Push cross-tab selection into the drill filters (lets Lisa override after).
-                # Fix 5/19 (Bug 1): cross-tab selection now ADDS to the existing filter set
-                # rather than REPLACING it. And when the cross-tab deselects (None), we leave
-                # the user's filter alone instead of wiping it. Lisa expects the multiselect
-                # to retain her picks even after she scopes from the cross-tab.
+                xt3_selected_reasons = []
+                reverse_reason_labels = {v: k for k, v in REASON_DISPLAY_LABELS.items()}
+                for col_label in xt3_sel_cols:
+                    if col_label in ("Grand Total", "Sales COGS", "%"):
+                        continue
+                    raw = col_label
+                    for prefix in ("🚫 ", "✅ ", "⚠️ "):
+                        if col_label.startswith(prefix):
+                            raw = col_label[len(prefix):]
+                            break
+                    raw = reverse_reason_labels.get(raw, raw)
+                    xt3_selected_reasons.append(raw)
+
+                # Sync the drill filters to the cross-tab selection.
+                # Replace (not additive): cross-tab is now the source of truth for scoping.
+                # When the user manually edits the multiselect filters below, those edits
+                # persist between cross-tab interactions — only an actual change to the
+                # cross-tab selection overwrites the filter.
                 cat_filter_key = f"lw_drill_cat_filter_{selected_store}"
                 rsn_filter_key = f"lw_drill_reason_filter_{selected_store}"
                 applied_sel_key = f"lw_xt_applied_sel_{selected_store}"
-                current_xt_sel = (xt3_selected_cat, xt3_selected_reason)
+                current_xt_sel = (tuple(xt3_selected_cats), tuple(xt3_selected_reasons))
                 prev_applied = st.session_state.get(applied_sel_key)
                 if current_xt_sel != prev_applied:
-                    if xt3_selected_cat:
-                        existing_cats = list(st.session_state.get(cat_filter_key, []) or [])
-                        if xt3_selected_cat not in existing_cats:
-                            existing_cats.append(xt3_selected_cat)
-                        st.session_state[cat_filter_key] = existing_cats
-                    if xt3_selected_reason:
-                        existing_rsns = list(st.session_state.get(rsn_filter_key, []) or [])
-                        if xt3_selected_reason not in existing_rsns:
-                            existing_rsns.append(xt3_selected_reason)
-                        st.session_state[rsn_filter_key] = existing_rsns
+                    st.session_state[cat_filter_key] = list(xt3_selected_cats)
+                    st.session_state[rsn_filter_key] = list(xt3_selected_reasons)
                     st.session_state[applied_sel_key] = current_xt_sel
 
                 # ----- Drill panel -----
@@ -2049,18 +2168,54 @@ def main():
 
                 period_tag = selected_period or "all"
                 safe_store = selected_store.replace(" ", "_").replace("/", "-")
-                st.download_button(
-                    f"📥 Download {selected_store} Homework",
-                    data=buf,
-                    file_name=f"homework_{safe_store}_{period_tag}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    key="lw_homework_dl",
-                )
+
+                dl_col, gs_col = st.columns([1, 1])
+                with dl_col:
+                    st.download_button(
+                        f"📥 Download {selected_store} Homework (xlsx)",
+                        data=buf,
+                        file_name=f"homework_{safe_store}_{period_tag}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        key="lw_homework_dl",
+                    )
+                with gs_col:
+                    if has_sheets_config():
+                        if st.button(
+                            f"🔗 Create as Google Sheet",
+                            key="lw_homework_gs_btn",
+                            help="Creates a live Google Sheet with the same two tabs. "
+                                 "Share with the GM directly from the sheet.",
+                        ):
+                            with st.spinner("Creating Google Sheet..."):
+                                try:
+                                    gs_url = make_homework_gsheet(
+                                        sheets,
+                                        title=f"Homework {selected_store} {period_tag}",
+                                        share_with=[USER_EMAIL],
+                                    )
+                                    st.session_state["lw_homework_gs_url"] = gs_url
+                                    st.session_state["lw_homework_gs_label"] = (
+                                        f"{selected_store} · {period_tag} · "
+                                        f"{cart_count} flagged txn"
+                                    )
+                                except Exception as e:
+                                    st.error(f"Could not create Google Sheet: {e}")
+                    else:
+                        st.caption("Google Sheets not configured.")
+
+                last_gs_url = st.session_state.get("lw_homework_gs_url")
+                if last_gs_url:
+                    st.success(
+                        f"Last homework sheet ({st.session_state.get('lw_homework_gs_label', '')}): "
+                        f"[Open in Google Sheets]({last_gs_url})"
+                    )
+
                 st.caption(
                     f"Workbook: 'Shrinkage' tab (per-category OVERSOLD/UNDERSOLD for {selected_store}) "
                     f"+ 'Explanations needed' tab ({cart_count} flagged transaction(s) + GM Explanation column). "
-                    f"Dollar columns formatted as currency; rate column formatted as %."
+                    f"Dollar columns formatted as currency, rate column as %. The Explanations tab "
+                    f"is populated from the drill panel above (flag transactions and Add to Explanations Needed first)."
                 )
 
     # == Tab 3: Legacy Shrink ==
