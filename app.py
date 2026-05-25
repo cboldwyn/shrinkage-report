@@ -11,6 +11,23 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.5 (2026-05-25)
+- Drill table: fake select-all visual ✓ removed. Streamlit's st.dataframe
+  multi-row checkboxes are user-click-only (no programmatic API), so we
+  don't fake them. The Select-all-visible checkbox below the count line
+  still switches the Add button to "Add all visible" — that's the
+  workaround for bulk-add until Streamlit ships programmatic selection.
+- Column display: "Date Timestamp" renamed to "Date" across drill / cart
+  / homework export via DRILL_DISPLAY_LABELS. Underlying CSV column name
+  preserved.
+- Date Timestamp fallback moved to period_recon_wb level: drill / cart /
+  export all share the same source. Pre-v2.6.0 uploads that have only
+  "Date" will see it aliased automatically.
+- Google Sheet creation now uses Drive API directly with
+  supportsAllDrives=true (works for Shared Drives too, not just My Drive).
+- Drive folder config now visible inline (truncated ID) so it's obvious
+  whether the secret is being read. On error, a Troubleshooting expander
+  shows the resolved folder ID + service account email + common fixes.
 v2.6.4 (2026-05-25)
 - Homework export now contains ONLY the Explanations Needed tab. The
   Shrinkage summary tab is dropped (the combined Adjustment Breakdown
@@ -131,7 +148,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.4"
+VERSION = "2.6.5"
 
 # Email of the human owner of this app — used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -190,10 +207,13 @@ LISA_DRILL_COLS = [
 ]
 
 # Display labels — keep underlying CSV column names, only rename for display.
-# Lisa needs the Blaze batch identifier (per-batch UID, often equals METRC tag);
-# the CSV's "Batch SKU" column is that field, but the label is ambiguous.
+# - "Batch SKU" → "Blaze Batch": the column is the per-batch UID Lisa works
+#   with; the CSV label is ambiguous.
+# - "Date Timestamp" → "Date": the underlying CSV column is named
+#   "Date Timestamp" but in drill / cart / export Lisa just wants "Date".
 DRILL_DISPLAY_LABELS = {
     "Batch SKU": "Blaze Batch",
+    "Date Timestamp": "Date",
 }
 
 # Display labels for reason codes — shortens to fit the combined Per-Store
@@ -448,8 +468,29 @@ def make_homework_gsheet(sheets_dict, title, share_with=None, folder_id=None):
     gc = get_gspread_client()
     ts = datetime.now().strftime("%Y-%m-%d %H%M")
     full_title = f"{title} ({ts})"
+
+    # Create via the Drive API directly so we can pass supportsAllDrives=True
+    # (gspread's Client.create doesn't, which breaks creation inside Shared
+    # Drives). This also ensures the file lands in the folder owner's Drive
+    # so the service account's zero-byte quota is irrelevant.
     if folder_id:
-        sh = gc.create(full_title, folder_id=folder_id)
+        payload = {
+            "name": full_title,
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "parents": [folder_id],
+        }
+        try:
+            resp = gc.http_client.request(
+                "post",
+                "https://www.googleapis.com/drive/v3/files",
+                json=payload,
+                params={"supportsAllDrives": "true"},
+            )
+            spreadsheet_id = resp.json()["id"]
+            sh = gc.open_by_key(spreadsheet_id)
+        except Exception:
+            # Fallback to gspread's stock create() if http_client path fails
+            sh = gc.create(full_title, folder_id=folder_id)
     else:
         sh = gc.create(full_title)
 
@@ -1675,6 +1716,14 @@ def main():
 
         period_recon_wb = period_recon.copy() if not period_recon.empty else pd.DataFrame()
 
+        # Date Timestamp fallback: if the persisted recon data was uploaded
+        # before v2.6.0, "Date Timestamp" won't exist; alias from "Date" so
+        # the drill / cart / homework export all carry a date column.
+        if (not period_recon_wb.empty
+                and "Date Timestamp" not in period_recon_wb.columns
+                and "Date" in period_recon_wb.columns):
+            period_recon_wb["Date Timestamp"] = period_recon_wb["Date"]
+
         if period_recon_wb.empty:
             st.info("No reconciliation data for this period.")
         else:
@@ -2008,22 +2057,19 @@ def main():
                     help="Tick to flag every row in the current filtered view at once.",
                 )
 
-                # ✓ column logic: when select_all is ON, every visible row gets ✓
-                # (visual feedback the user expects). When OFF, only cart members
-                # carry the ✓.
-                if select_all:
-                    drill_scope["✓"] = "✓"
-                else:
-                    drill_scope["✓"] = drill_scope["_txn_id"].apply(
-                        lambda t: "✓" if t in cart_set_view else ""
-                    )
+                # ✓ column reflects ONLY cart membership (not select-all). Streamlit's
+                # st.dataframe multi-row selection is user-click-only — there's no API
+                # to programmatically set row-selection state, so we don't fake it.
+                # The Select-all-visible checkbox below controls what the Add button
+                # adds, but row-level checkmarks in the table are user-driven only.
+                drill_scope["✓"] = drill_scope["_txn_id"].apply(
+                    lambda t: "✓" if t in cart_set_view else ""
+                )
                 drill_display = drill_scope[["✓"] + drill_cols + ["_txn_id"]].reset_index(drop=True)
 
-                # Key depends on select_all state too, so the visual ✓ refreshes
-                # immediately when the user toggles select-all.
                 drill_key = (
                     f"lw_drill_event_v{st.session_state['lw_drill_event_version']}_"
-                    f"{selected_store}_{filter_sig}_sa{int(select_all)}"
+                    f"{selected_store}_{filter_sig}"
                 )
 
                 drill_event = st.dataframe(
@@ -2152,38 +2198,13 @@ def main():
                 # explanations against. No category-summary noise.
                 st.markdown("---")
 
-                # Date Timestamp fallback: if the persisted recon data was
-                # uploaded before v2.6.0 (no Date Timestamp column), use the
-                # plain Date column so the GM packet still has a date column.
-                def _ensure_date_col(df, source_df):
-                    """Add a Date Timestamp column if missing, using Date as fallback."""
-                    if "Date Timestamp" in df.columns:
-                        return df
-                    if "Date Timestamp" in source_df.columns:
-                        df = df.copy()
-                        df.insert(0, "Date Timestamp",
-                                  source_df.loc[df.index, "Date Timestamp"]
-                                  if df.index.isin(source_df.index).all()
-                                  else source_df["Date Timestamp"].reindex(df.index))
-                        return df
-                    if "Date" in source_df.columns:
-                        df = df.copy()
-                        df.insert(0, "Date Timestamp",
-                                  source_df["Date"].reindex(df.index))
-                        return df
-                    return df
-
-                # Build the Explanations Needed cart export. Ensure Date Timestamp
-                # is present even if the upstream persisted data dropped it.
+                # Build the Explanations Needed cart export. Date Timestamp is
+                # already aliased from Date in period_recon_wb if needed.
                 if cart_count > 0:
-                    cart_export = cart_sorted[drill_cols_for_cart].copy()
-                    cart_export = _ensure_date_col(cart_export, cart_sorted)
-                    cart_export = _apply_drill_labels(cart_export)
+                    cart_export = _apply_drill_labels(cart_sorted[drill_cols_for_cart].copy())
                 else:
                     cart_export = pd.DataFrame(
-                        columns=["Date Timestamp"] + [DRILL_DISPLAY_LABELS.get(c, c)
-                                                     for c in drill_cols_for_cart
-                                                     if c != "Date Timestamp"]
+                        columns=[DRILL_DISPLAY_LABELS.get(c, c) for c in drill_cols_for_cart]
                     )
                 cart_export["GM Explanation"] = ""
 
@@ -2229,6 +2250,13 @@ def main():
                     )
                 with gs_col:
                     if has_sheets_config():
+                        folder_id = _homework_drive_folder_id()
+                        sa_email = _service_account_email()
+                        if folder_id:
+                            short_fid = folder_id[:8] + "…" + folder_id[-4:] if len(folder_id) > 16 else folder_id
+                            st.caption(f"📁 Drive folder configured: `{short_fid}`")
+                        else:
+                            st.caption("⚠️ No `homework_drive_folder_id` secret set; will hit service account quota.")
                         if st.button(
                             f"🔗 Create as Google Sheet",
                             key="lw_homework_gs_btn",
@@ -2236,7 +2264,6 @@ def main():
                             disabled=(cart_count == 0),
                         ):
                             with st.spinner("Creating Google Sheet..."):
-                                folder_id = _homework_drive_folder_id()
                                 try:
                                     gs_url = make_homework_gsheet(
                                         sheets,
@@ -2251,25 +2278,36 @@ def main():
                                     )
                                 except Exception as e:
                                     err_str = str(e)
-                                    if "storage quota" in err_str.lower() or "[403]" in err_str:
-                                        st.error(
-                                            "Google Drive storage quota exceeded on the service account. "
-                                            "To fix this, you need to point the app at a Drive folder you "
-                                            "own (the file then lives in your Drive, not the service account's)."
-                                        )
-                                        sa_email = _service_account_email()
+                                    quota_hit = ("storage quota" in err_str.lower()
+                                                 or "[403]" in err_str
+                                                 or "userRateLimitExceeded" in err_str)
+                                    st.error(f"Could not create Google Sheet: {e}")
+                                    with st.expander("Troubleshooting"):
                                         st.markdown(
-                                            f"**One-time setup:**\n\n"
-                                            f"1. In Google Drive, create a folder (e.g. 'Shrinkage Homework Sheets').\n"
-                                            f"2. Right-click the folder, Share, add **`{sa_email or '(service account email from your Streamlit secrets)'}`** as Editor.\n"
-                                            f"3. Copy the folder ID from the URL (the part after `/folders/`).\n"
-                                            f"4. In Streamlit Cloud, open this app's Settings, Secrets, "
-                                            f"and add the line:  \n"
-                                            f"   `homework_drive_folder_id = \"<paste folder ID here>\"`\n"
-                                            f"5. Reload the app and try Create as Google Sheet again."
+                                            f"**Service account email** (must be Editor on your folder):  \n"
+                                            f"`{sa_email or '(not found in secrets)'}`\n\n"
+                                            f"**Folder ID being used:**  \n"
+                                            f"`{folder_id or '(none — secret missing)'}`\n\n"
+                                            f"**Common fixes:**\n"
+                                            f"- Verify the secret key is exactly `homework_drive_folder_id` "
+                                            f"(top-level, NOT nested under `[google_sheets]`).\n"
+                                            f"- Verify the folder above is shared with the service account "
+                                            f"email as **Editor** (not Viewer).\n"
+                                            f"- If the folder is in a Shared Drive, make sure the service "
+                                            f"account is a member of that Shared Drive (Manage members).\n"
+                                            f"- Click 'Reboot app' in Streamlit Cloud after saving secrets — "
+                                            f"the secrets file is cached until reboot."
                                         )
-                                    else:
-                                        st.error(f"Could not create Google Sheet: {e}")
+                                        if quota_hit and not folder_id:
+                                            st.markdown(
+                                                f"**One-time setup (no folder configured yet):**\n\n"
+                                                f"1. Create a folder in your Drive.\n"
+                                                f"2. Share it with `{sa_email}` as Editor.\n"
+                                                f"3. Copy folder ID from URL.\n"
+                                                f"4. Add to Streamlit secrets: "
+                                                f"`homework_drive_folder_id = \"<id>\"`\n"
+                                                f"5. Reboot app."
+                                            )
                         if cart_count == 0:
                             st.caption("_Flag transactions first (drill panel above), then create the sheet._")
                     else:
