@@ -11,6 +11,14 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.10 (2026-05-28)
+- Fix column-drift corruption in Google Sheets storage. append_to_sheets
+  only wrote a header when the sheet was empty, then appended every later
+  upload positionally. When RECON_STORE_COLS was expanded/reordered in
+  v2.6.0, new uploads landed scrambled under the old narrow header (Category
+  showed Reconciliation No, Reason showed Old Quantity). Rows are now aligned
+  to the stored header BY NAME before appending, so column changes can never
+  scramble stored data again. Paired with a one-time sheet repair migration.
 v2.6.9 (2026-05-28)
 - Fix crash when a week's recon export has an entirely-empty Reason column.
   pandas typed the column as float64, so the "No Reason" filter's
@@ -185,7 +193,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.9"
+VERSION = "2.6.10"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -681,24 +689,48 @@ def get_stored_week_ids():
 
 
 def append_to_sheets(df, worksheet_name):
-    """Append rows to a Google Sheets worksheet. Writes headers if sheet is empty."""
+    """Append rows to a Google Sheets worksheet, aligned to the stored header.
+
+    Rows are aligned to the sheet's existing header BY NAME before appending.
+    This is the guard against column drift: if RECON_STORE_COLS is reordered or
+    expanded (as in v2.6.0), positional appends would otherwise land data under
+    the wrong headers and silently scramble every later read. Columns missing
+    from this upload are written blank; columns not present in the header are
+    dropped rather than shifting everything that follows.
+    """
     client = get_gspread_client()
     sheet = client.open_by_url(SHEETS_URL)
     ws = sheet.worksheet(worksheet_name)
 
-    # Write header row if the sheet is empty
     existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(df.columns.tolist(), value_input_option="USER_ENTERED")
+    if not existing or not any(existing[0]):
+        # Empty sheet: the dataframe defines the header.
+        header = df.columns.tolist()
+        ws.append_row(header, value_input_option="USER_ENTERED")
+    else:
+        header = list(existing[0])
+        # Legacy sheets padded the header with trailing empty cells; trim them.
+        while header and header[-1] == "":
+            header.pop()
 
-    # Convert NaN/NaT to empty strings for JSON serialization
+    # Convert NaN/NaT to empty strings, keep numeric columns as numbers.
     clean = df.fillna("").astype(str)
-    # Restore numeric columns as numbers (not strings)
     for col in df.columns:
         if pd.api.types.is_numeric_dtype(df[col]):
             clean[col] = df[col].fillna(0)
-    rows = clean.values.tolist()
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+    missing = [c for c in df.columns if c not in header]
+    if missing:
+        st.warning(
+            "These uploaded columns are not in the sheet header and will not be "
+            f"stored: {', '.join(missing)}. The sheet header needs migrating to "
+            "include them."
+        )
+
+    # Reindex to the stored header so every appended row matches it positionally.
+    aligned = clean.reindex(columns=header, fill_value="")
+    rows = aligned.values.tolist()
+    ws.append_rows(rows, value_input_option="RAW")
 
 
 # ============================================================================
