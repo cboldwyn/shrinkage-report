@@ -11,6 +11,12 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.6.9 (2026-05-28)
+- Fix crash when a week's recon export has an entirely-empty Reason column.
+  pandas typed the column as float64, so the "No Reason" filter's
+  .str.strip() raised AttributeError and took the whole app down. Reason
+  and Reason Note are now coerced to string at load, so blank-reason rows
+  show under "No Reason" instead of crashing.
 v2.6.8 (2026-05-25)
 - New Accounting tab (replaces Shrinkage by Location). Per-store table
   with QuickBooks book-entry line items: Display, Defective, Expired
@@ -179,7 +185,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.8"
+VERSION = "2.6.9"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -1307,6 +1313,15 @@ def main():
     # cart, export) sees a consistent column.
     if "Date Timestamp" not in all_recon.columns and "Date" in all_recon.columns:
         all_recon["Date Timestamp"] = all_recon["Date"]
+
+    # Reason / Reason Note can load as all-NaN float64 when a week's export has
+    # no reason codes at all (the "reason none" data-pipeline drop). pandas then
+    # types the column as floating and any downstream .str access raises
+    # AttributeError, crashing the whole app. Force these text columns to string
+    # so blank-reason rows surface as "No Reason" instead of taking the app down.
+    for _text_col in ("Reason", "Reason Note"):
+        if _text_col in all_recon.columns:
+            all_recon[_text_col] = all_recon[_text_col].fillna("").astype(str)
 
     # ----------------------------------------------------------------
     # Filter to selected period
