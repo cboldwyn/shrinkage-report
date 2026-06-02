@@ -1773,63 +1773,79 @@ def main():
         "Total Sales Detail", type=["csv"], key="upload_sales",
         help="Blaze > Data Export > Total Sales Detail",
     )
-    if file_recon and file_sales:
+    if file_recon or file_sales:
+        st.sidebar.caption(
+            "Total Sales Detail alone loads Discounts. Add Inventory Reconciliation "
+            "History to also update Shrinkage."
+        )
         if st.sidebar.button("Upload & Process", type="primary"):
             with st.spinner("Processing uploads..."):
-                recon_upload = load_recon_csv(file_recon)
-                sales_upload = load_sales_csv(file_sales)
-                discount_weekly_up, discount_detail_up = load_discount_csv(file_sales)
-                if recon_upload is not None and sales_upload is not None:
-                    upload_weeks = set(recon_upload["week_id"].dropna().unique())
-                    appended_any = False
-                    if sheets_ok:
-                        existing = get_stored_week_ids()
-                        dupes = upload_weeks & existing
+                recon_upload = load_recon_csv(file_recon) if file_recon else None
+                sales_upload = load_sales_csv(file_sales) if file_sales else None
+                discount_weekly_up, discount_detail_up = (
+                    load_discount_csv(file_sales) if file_sales else (None, None)
+                )
+                appended_any = False
+                msg_weeks = set()
+                if sheets_ok:
+                    # Shrinkage (recon + sales) processes as a pair.
+                    if recon_upload is not None and sales_upload is not None:
+                        upload_weeks = set(recon_upload["week_id"].dropna().unique())
+                        dupes = upload_weeks & get_stored_week_ids()
                         if dupes:
                             st.sidebar.warning(
-                                f"Skipping existing: {', '.join(week_id_to_label(w) for w in sorted(dupes))}"
+                                f"Skipping existing shrink week(s): {', '.join(week_id_to_label(w) for w in sorted(dupes))}"
                             )
                             recon_upload = recon_upload[~recon_upload["week_id"].isin(dupes)]
                             sales_upload = sales_upload[~sales_upload["week_id"].isin(dupes)]
-                        # Discounts ride the same Total Sales Detail file but dedup
-                        # against their own worksheet (accumulation started later).
-                        if discount_weekly_up is not None and not discount_weekly_up.empty:
-                            d_existing = get_stored_week_ids(DISCOUNT_WEEKLY_WS)
-                            d_new = set(discount_weekly_up["week_id"].dropna().unique()) - d_existing
-                            dw = discount_weekly_up[discount_weekly_up["week_id"].isin(d_new)]
-                            dd = (discount_detail_up[discount_detail_up["week_id"].isin(d_new)]
-                                  if discount_detail_up is not None else pd.DataFrame())
-                            if not dw.empty:
-                                ensure_worksheet(DISCOUNT_WEEKLY_WS, DISCOUNT_WEEKLY_HEADER)
-                                ensure_worksheet(DISCOUNT_DETAIL_WS, DISCOUNT_DETAIL_HEADER)
-                                append_to_sheets(dw, DISCOUNT_WEEKLY_WS)
-                                if dd is not None and not dd.empty:
-                                    append_to_sheets(dd, DISCOUNT_DETAIL_WS)
-                                load_discount_weekly_from_sheets.clear()
-                                load_discount_detail_from_sheets.clear()
-                                appended_any = True
                         if not recon_upload.empty:
                             append_to_sheets(recon_upload, RECON_WORKSHEET)
                             append_to_sheets(sales_upload, SALES_WORKSHEET)
                             load_recon_from_sheets.clear()
                             load_sales_from_sheets.clear()
+                            msg_weeks |= upload_weeks
                             appended_any = True
-                    else:
+                    # Discounts only need the Total Sales Detail.
+                    if discount_weekly_up is not None and not discount_weekly_up.empty:
+                        d_all = set(discount_weekly_up["week_id"].dropna().unique())
+                        d_new = d_all - get_stored_week_ids(DISCOUNT_WEEKLY_WS)
+                        dw = discount_weekly_up[discount_weekly_up["week_id"].isin(d_new)]
+                        dd = (discount_detail_up[discount_detail_up["week_id"].isin(d_new)]
+                              if discount_detail_up is not None else pd.DataFrame())
+                        if dw.empty:
+                            st.sidebar.info(
+                                f"Discount week(s) already loaded: {', '.join(week_id_to_label(w) for w in sorted(d_all))}"
+                            )
+                        else:
+                            ensure_worksheet(DISCOUNT_WEEKLY_WS, DISCOUNT_WEEKLY_HEADER)
+                            ensure_worksheet(DISCOUNT_DETAIL_WS, DISCOUNT_DETAIL_HEADER)
+                            append_to_sheets(dw, DISCOUNT_WEEKLY_WS)
+                            if dd is not None and not dd.empty:
+                                append_to_sheets(dd, DISCOUNT_DETAIL_WS)
+                            load_discount_weekly_from_sheets.clear()
+                            load_discount_detail_from_sheets.clear()
+                            msg_weeks |= d_new
+                            appended_any = True
+                else:
+                    if recon_upload is not None and sales_upload is not None:
                         prev_r = st.session_state.get("recon_data", pd.DataFrame())
                         prev_s = st.session_state.get("sales_data", pd.DataFrame())
                         st.session_state["recon_data"] = pd.concat([prev_r, recon_upload], ignore_index=True)
                         st.session_state["sales_data"] = pd.concat([prev_s, sales_upload], ignore_index=True)
-                        if discount_weekly_up is not None and not discount_weekly_up.empty:
-                            prev_dw = st.session_state.get("discount_weekly_data", pd.DataFrame())
-                            prev_dd = st.session_state.get("discount_detail_data", pd.DataFrame())
-                            st.session_state["discount_weekly_data"] = pd.concat([prev_dw, discount_weekly_up], ignore_index=True)
-                            st.session_state["discount_detail_data"] = pd.concat([prev_dd, discount_detail_up], ignore_index=True)
+                        msg_weeks |= set(recon_upload["week_id"].dropna().unique())
                         appended_any = True
-                    if appended_any:
-                        st.sidebar.success(f"Uploaded {len(upload_weeks)} week(s)")
-                        st.rerun()
-                    else:
-                        st.sidebar.info("No new data to upload.")
+                    if discount_weekly_up is not None and not discount_weekly_up.empty:
+                        prev_dw = st.session_state.get("discount_weekly_data", pd.DataFrame())
+                        prev_dd = st.session_state.get("discount_detail_data", pd.DataFrame())
+                        st.session_state["discount_weekly_data"] = pd.concat([prev_dw, discount_weekly_up], ignore_index=True)
+                        st.session_state["discount_detail_data"] = pd.concat([prev_dd, discount_detail_up], ignore_index=True)
+                        msg_weeks |= set(discount_weekly_up["week_id"].dropna().unique())
+                        appended_any = True
+                if appended_any:
+                    st.sidebar.success(f"Processed {len(msg_weeks)} week(s)")
+                    st.rerun()
+                else:
+                    st.sidebar.info("No new data to upload.")
 
     st.sidebar.markdown("---")
     st.sidebar.caption(f"v{VERSION}")
