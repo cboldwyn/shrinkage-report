@@ -11,6 +11,19 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.7.0 (2026-06-01)
+- Renamed "Shrinkage Dashboard" to "Retail Reporting"; the app now hosts
+  shrinkage plus a new Discounts module off the same Total Sales Detail upload.
+- Discounts: reconciliation-first. Every discount dollar is attributed to one
+  of four buckets (Loyalty, Employee, Promotional, Member/Manual) that reconcile
+  to the grand total; bucket definitions live in DISCOUNT_BUCKETS and are shown
+  in the UI so they can be walked through and challenged. Reproduces Albert's
+  weekly cuts (by store / promotion / cart promo / employee / member group /
+  loyalty / discount notes) with a one-click workbook download, and adds
+  change-over-time (total, bucket mix in $ and share, by store, discount rate).
+  Persists to two new worksheets (discount_weekly, discount_detail), Sun-Sat,
+  accumulating weekly. Surfaces the loyalty redemptions Blaze leaves untagged
+  (Pillar 3) that Albert's by-promotion "(blank)" line otherwise hides.
 v2.6.10 (2026-05-28)
 - Fix column-drift corruption in Google Sheets storage. append_to_sheets
   only wrote a header when the sheet was empty, then appended every later
@@ -179,6 +192,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import io
+import re
 from datetime import datetime, timedelta
 
 try:
@@ -193,14 +207,14 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.6.10"
+VERSION = "2.7.0"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
 USER_EMAIL = "charles@myhavenstores.com"
 
 st.set_page_config(
-    page_title=f"Shrinkage Dashboard v{VERSION}",
+    page_title=f"Retail Reporting v{VERSION}",
     page_icon="📉",
     layout="wide",
 )
@@ -210,6 +224,8 @@ st.set_page_config(
 SHEETS_URL = "https://docs.google.com/spreadsheets/d/1L2Obnx3PErGvGUpzB8KmDpJTw--4gjVFoBN-QB402-c"
 RECON_WORKSHEET = "recon_data"
 SALES_WORKSHEET = "sales_cogs"
+DISCOUNT_WEEKLY_WS = "discount_weekly"
+DISCOUNT_DETAIL_WS = "discount_detail"
 
 # -- Store mapping --
 STORE_NAME_MAP = {
@@ -241,6 +257,49 @@ RECON_STORE_COLS = [
     "Cost per Unit", "COGS", "Reason", "Reason Note",
 ]
 SALES_REQUIRED_COLS = ["Date", "Shop", "Product Category", "COGS"]
+
+# -- Discounts (Retail Reporting) --
+# Pulled from the SAME Blaze Total Sales Detail export that feeds sales COGS.
+DISCOUNT_SRC_COLS = [
+    "Date", "Shop", "Pre Tax Discounts", "Product Discounts", "Cart Discounts",
+    "Product Promotions", "Cart Promotions", "Member Group",
+    "Loyalty Points Spent", "Discount Notes", "Retail Price", "Effective Retail Price",
+]
+DISCOUNT_CANON_COL = "Pre Tax Discounts"        # canonical discount $ (= Product + Cart Discounts)
+DISCOUNT_GROSS_COL = "Effective Retail Price"   # denominator for discount rate
+
+# Methodology as data: ordered buckets, precedence top-down (first match wins).
+# Every discounted line lands in exactly one bucket, so the four reconcile to the
+# grand total. Edit here to change or challenge a definition; the UI text and the
+# reconciliation update together.
+DISCOUNT_BUCKETS = [
+    ("Loyalty",
+     "Loyalty Points Spent > 0. Point redemptions. Blaze applies the value as a "
+     "discount but leaves Product/Cart Promotions blank, so these masquerade as "
+     "manual discounts unless you filter on points."),
+    ("Employee",
+     "Product Promotions contains \"Employee\". Employee comp taken through the "
+     "employee promo button."),
+    ("Promotional",
+     "Any Product or Cart Promotion present. Haven Hauls, BOGOs, coupons, sales."),
+    ("Member/Manual",
+     "No promotion and no loyalty points. Member-group price rules plus manual "
+     "register discounts (the discretion residue worth watching)."),
+]
+DISCOUNT_BUCKET_NAMES = [name for name, _ in DISCOUNT_BUCKETS]
+DISCOUNT_WEEKLY_HEADER = (
+    ["week_id", "Store", "Gross Retail", "Total"] + DISCOUNT_BUCKET_NAMES + ["uploaded_at"]
+)
+DISCOUNT_DETAIL_HEADER = [
+    "week_id", "dimension", "store", "label", "amount", "txn_count", "uploaded_at",
+]
+# Inlined hex (COLOR_* constants are defined further down; avoid forward ref).
+DISCOUNT_BUCKET_TREND_COLORS = {
+    "Loyalty": "#3DC0CC",
+    "Employee": "#FFCA45",
+    "Promotional": "#9E1F63",
+    "Member/Manual": "#95A5A6",
+}
 
 # Lisa's drill-down column subset. Keep order. Lisa scans left to right.
 # Order locked 5/19 PM (DC/Retail Touch Base): the things she needs first are on the left;
@@ -637,6 +696,26 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def ensure_worksheet(worksheet_name, header):
+    """Create a worksheet with a header row if it does not exist yet.
+
+    Lets new persistence streams (the discount worksheets) self-provision, so
+    there is no manual Google Sheet setup step.
+    """
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_url(SHEETS_URL)
+        try:
+            sheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(
+                title=worksheet_name, rows=1, cols=max(2, len(header))
+            )
+            ws.append_row(header, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+
 @st.cache_data(ttl=300, show_spinner="Loading data from Google Sheets...")
 def load_recon_from_sheets():
     """Read all recon data from Google Sheets."""
@@ -676,12 +755,53 @@ def load_sales_from_sheets():
         return pd.DataFrame()
 
 
-def get_stored_week_ids():
-    """Return set of week_ids already in Google Sheets recon data."""
+@st.cache_data(ttl=300, show_spinner="Loading discount data...")
+def load_discount_weekly_from_sheets():
+    """Read the weekly discount partition from Google Sheets (empty if absent)."""
     try:
         client = get_gspread_client()
         sheet = client.open_by_url(SHEETS_URL)
-        ws = sheet.worksheet(RECON_WORKSHEET)
+        ws = sheet.worksheet(DISCOUNT_WEEKLY_WS)
+        df = get_as_dataframe(ws, parse_dates=False, header=0)
+        df = df.dropna(how="all")
+        if df.empty:
+            return pd.DataFrame()
+        for c in ["Gross Retail", "Total"] + DISCOUNT_BUCKET_NAMES:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df["week_id"] = df["week_id"].astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner="Loading discount detail...")
+def load_discount_detail_from_sheets():
+    """Read the discount detail long table from Google Sheets (empty if absent)."""
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_url(SHEETS_URL)
+        ws = sheet.worksheet(DISCOUNT_DETAIL_WS)
+        df = get_as_dataframe(ws, parse_dates=False, header=0)
+        df = df.dropna(how="all")
+        if df.empty:
+            return pd.DataFrame()
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+        df["txn_count"] = pd.to_numeric(df["txn_count"], errors="coerce").fillna(0).astype(int)
+        for c in ["week_id", "dimension", "store", "label"]:
+            if c in df.columns:
+                df[c] = df[c].fillna("").astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_stored_week_ids(worksheet=RECON_WORKSHEET):
+    """Return the set of week_ids already stored in a worksheet (week_id is col 1)."""
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_url(SHEETS_URL)
+        ws = sheet.worksheet(worksheet)
         col_values = ws.col_values(1)  # week_id is first column
         return set(col_values[1:])  # skip header
     except Exception:
@@ -788,6 +908,153 @@ def load_sales_csv(uploaded_file):
     )
     agg["uploaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return agg
+
+
+def clean_promo_label(s):
+    """Strip Blaze's {"..."} wrapper and trailing promo id from a promotion label."""
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if not s:
+        return ""
+    if s.startswith('{"') and s.endswith('"}'):
+        s = s[2:-2]
+    elif s.startswith("{") and s.endswith("}"):
+        s = s.strip("{}").strip().strip('"')
+    s = re.sub(r"\s*[–\-]\s*\d{4,}\s*$", "", s)  # drop trailing " - 0050239" (hyphen or en dash)
+    return s.strip()
+
+
+def classify_discount_bucket(df):
+    """Assign each row to exactly one DISCOUNT_BUCKETS bucket. Precedence top-down."""
+    pts = pd.to_numeric(df["Loyalty Points Spent"], errors="coerce").fillna(0)
+    pp = df["Product Promotions"].fillna("").astype(str).str.strip()
+    cp = df["Cart Promotions"].fillna("").astype(str).str.strip()
+    bucket = pd.Series("Member/Manual", index=df.index)
+    bucket[(pp != "") | (cp != "")] = "Promotional"
+    bucket[pp.str.contains("Employee", case=False, na=False)] = "Employee"
+    bucket[pts > 0] = "Loyalty"
+    return bucket
+
+
+def _disc_rows(work, dim, key_col, mask=None, with_store=False):
+    """Aggregate one discount-detail dimension into tidy-long rows."""
+    sub = work if mask is None else work[mask]
+    if sub.empty:
+        return []
+    keys = ["week_id"] + (["Store"] if with_store else []) + [key_col]
+    g = (
+        sub.groupby(keys, dropna=False)["_d"]
+        .agg(amount="sum", txn_count=lambda s: int((s != 0).sum()))
+        .reset_index()
+    )
+    out = []
+    for _, r in g.iterrows():
+        label = str(r[key_col]).strip()
+        out.append({
+            "week_id": r["week_id"],
+            "dimension": dim,
+            "store": r["Store"] if with_store else "",
+            "label": label if label else "(blank)",
+            "amount": round(float(r["amount"]), 2),
+            "txn_count": int(r["txn_count"]),
+        })
+    return out
+
+
+def _build_discount_detail(df):
+    """Tidy-long discount_detail rows from a prepared frame (has _d, _pts, week_id, Store)."""
+    pp = df["Product Promotions"].fillna("").astype(str).str.strip()
+    cp = df["Cart Promotions"].fillna("").astype(str).str.strip()
+    pts = df["_pts"]
+    w = df.copy()
+    w["_promo"] = pp.map(clean_promo_label)
+    w["_cart"] = cp.map(clean_promo_label)
+    w["_mg"] = df["Member Group"].fillna("").astype(str).str.strip()
+    w["_note"] = df["Discount Notes"].fillna("").astype(str).str.strip()
+
+    rows = []
+    rows += _disc_rows(w, "by_promotion", "_promo")
+    rows += _disc_rows(w, "by_cart_promo", "_cart")
+    rows += _disc_rows(w[(pts == 0) & (pp == "") & (cp == "")], "by_member_group", "_mg", with_store=True)
+    rows += _disc_rows(w[pp.str.contains("Employee", case=False, na=False)], "by_employee", "Store")
+    rows += _disc_rows(w[w["_note"] != ""], "discount_note", "_note")
+
+    # Decompose the by-promotion "(blank)" line per week (the story Albert's report hides).
+    blank = pp == ""
+    for wk, g in w[blank].groupby("week_id"):
+        gpts = g["_pts"]
+        gcp = g["Cart Promotions"].fillna("").astype(str).str.strip()
+        parts = [
+            ("Loyalty (points > 0)", g.loc[gpts > 0, "_d"].sum()),
+            ("Cart promo only", g.loc[(gpts == 0) & (gcp != ""), "_d"].sum()),
+            ("Truly manual (no promo, no points)", g.loc[(gpts == 0) & (gcp == ""), "_d"].sum()),
+        ]
+        for label, amt in parts:
+            rows.append({
+                "week_id": wk, "dimension": "blank_line_decomp", "store": "",
+                "label": label, "amount": round(float(amt), 2), "txn_count": 0,
+            })
+
+    return pd.DataFrame(rows, columns=["week_id", "dimension", "store", "label", "amount", "txn_count"])
+
+
+def load_discount_csv(uploaded_file):
+    """From a Blaze Total Sales Detail CSV, build the weekly discount partition + detail table.
+
+    Reads the discount columns off the SAME file used for sales COGS (seek to 0 first,
+    since load_sales_csv already consumed the buffer). Returns (weekly_df, detail_df),
+    or (None, None) if the discount columns are missing.
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    try:
+        df = pd.read_csv(uploaded_file, usecols=DISCOUNT_SRC_COLS, low_memory=False)
+    except ValueError:
+        st.error(
+            "Could not find the discount columns in the Total Sales Detail CSV "
+            f"(need: {', '.join(DISCOUNT_SRC_COLS)})."
+        )
+        return None, None
+
+    df["_d"] = pd.to_numeric(df[DISCOUNT_CANON_COL], errors="coerce").fillna(0)
+    df["_gross"] = pd.to_numeric(df[DISCOUNT_GROSS_COL], errors="coerce").fillna(0)
+    df["_pts"] = pd.to_numeric(df["Loyalty Points Spent"], errors="coerce").fillna(0)
+    df["_date"] = pd.to_datetime(df["Date"], format="mixed", errors="coerce")
+    df["week_id"] = df["_date"].apply(lambda d: get_week_id(d) if pd.notna(d) else None)
+    df["Store"] = df["Shop"].map(short_store_name)
+    df = df[df["week_id"].notna()].copy()
+    if df.empty:
+        return (pd.DataFrame(columns=DISCOUNT_WEEKLY_HEADER),
+                pd.DataFrame(columns=DISCOUNT_DETAIL_HEADER))
+
+    df["_bucket"] = classify_discount_bucket(df)
+
+    # Weekly partition: week x store, buckets as columns (reconcile to Total).
+    base = df.groupby(["week_id", "Store"], as_index=False).agg(
+        **{"Gross Retail": ("_gross", "sum"), "Total": ("_d", "sum")}
+    )
+    pivot = (
+        df.pivot_table(index=["week_id", "Store"], columns="_bucket",
+                       values="_d", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    weekly = base.merge(pivot, on=["week_id", "Store"], how="left")
+    for name in DISCOUNT_BUCKET_NAMES:
+        if name not in weekly.columns:
+            weekly[name] = 0.0
+        weekly[name] = pd.to_numeric(weekly[name], errors="coerce").fillna(0).round(2)
+    weekly["Gross Retail"] = weekly["Gross Retail"].round(2)
+    weekly["Total"] = weekly["Total"].round(2)
+    weekly["uploaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    weekly = weekly[DISCOUNT_WEEKLY_HEADER]
+
+    detail = _build_discount_detail(df)
+    detail["uploaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detail = detail[DISCOUNT_DETAIL_HEADER]
+    return weekly, detail
 
 
 # ============================================================================
@@ -1209,8 +1476,228 @@ def compute_group_total(recon_df, reasons):
     return filtered["COGS"].sum(), len(filtered)
 
 
+def apply_week_labels(fig, week_ids):
+    """Human-readable Sun-Sat week labels on the x-axis (week_ids are Sunday dates)."""
+    uniq = sorted(set(str(w) for w in week_ids if pd.notna(w) and str(w)))
+    fig.update_xaxes(
+        ticktext=[week_id_to_label(w) for w in uniq], tickvals=uniq, tickangle=-45
+    )
+
+
+def render_discounts_tab(weekly, detail, selected_period, period_key):
+    """Discounts module: reconciliation, the story Albert's cuts hide, his cuts, and trends."""
+    st.caption(
+        "Discount reporting off the same Blaze Total Sales Detail upload that feeds shrinkage "
+        "(Sun-Sat weeks). Every discount dollar is attributed to exactly one bucket and the four "
+        "reconcile to the grand total. Reproduces Albert's weekly cuts and adds change-over-time. "
+        "Bucket definitions are shown so each number can be walked through and challenged."
+    )
+    if weekly is None or weekly.empty:
+        st.info(
+            "No discount data yet. Upload a Total Sales Detail CSV in the sidebar "
+            "(the same file used for sales COGS) to populate discounts."
+        )
+        return
+
+    weeks_all = sorted(weekly["week_id"].dropna().astype(str).unique())
+    if period_key == "weekly":
+        sel_weeks = [selected_period] if selected_period in weeks_all else weeks_all[-1:]
+    else:
+        sel_weeks = [
+            w for w in weeks_all
+            if get_month_id(datetime.strptime(w, "%Y-%m-%d")) == str(selected_period)
+        ] or weeks_all[-1:]
+    wk_label = ", ".join(week_id_to_label(w) for w in sel_weeks) if sel_weeks else "n/a"
+    wk = weekly[weekly["week_id"].isin(sel_weeks)]
+    det = (
+        detail[detail["week_id"].isin(sel_weeks)]
+        if (detail is not None and not detail.empty) else pd.DataFrame()
+    )
+
+    # ---- Section A: Reconciliation ----
+    st.subheader(f"Reconciliation: {wk_label}")
+    grand = float(wk["Total"].sum())
+    if grand == 0:
+        st.info("No discounts recorded for this period.")
+    else:
+        metric_cols = st.columns(len(DISCOUNT_BUCKET_NAMES) + 1)
+        metric_cols[0].metric("Grand Total", format_currency(grand))
+        bucket_sum = 0.0
+        for i, name in enumerate(DISCOUNT_BUCKET_NAMES):
+            amt = float(wk[name].sum()) if name in wk.columns else 0.0
+            bucket_sum += amt
+            metric_cols[i + 1].metric(
+                name, format_currency(amt), f"{amt / grand * 100:.1f}%", delta_color="off"
+            )
+        residual = grand - bucket_sum
+        st.caption(
+            f"Buckets sum to {format_currency(bucket_sum)}. Residual (unattributed): "
+            f"{format_currency(residual)}."
+        )
+        with st.expander("How each bucket is calculated (walk and challenge with Lisa)"):
+            for name, definition in DISCOUNT_BUCKETS:
+                st.markdown(f"- **{name}**: {definition}")
+            st.caption(
+                "Precedence is top-down (first match wins), so every discounted line lands in "
+                "exactly one bucket and the four reconcile to the grand total. Edit DISCOUNT_BUCKETS "
+                "to change a definition."
+            )
+
+    # ---- Section B: Needs a story ----
+    if not det.empty:
+        decomp = det[det["dimension"] == "blank_line_decomp"]
+        if not decomp.empty and decomp["amount"].abs().sum() > 0:
+            st.markdown("---")
+            st.subheader("Needs a story")
+            st.caption(
+                "Albert's by-promotion report collapses these into a single \"(blank)\" line. "
+                "They are not one thing:"
+            )
+            dd = (
+                decomp.groupby("label", as_index=False)["amount"].sum()
+                .sort_values("amount", ascending=False)
+                .rename(columns={"label": "Within the (blank) promotion line", "amount": "Discount $"})
+            )
+            st.dataframe(
+                dd.style.format({"Discount $": "${:,.2f}"}),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Loyalty here is point redemptions Blaze never tags as a promotion (Pillar 3). "
+                "Truly manual is the register-discretion residue worth watching."
+            )
+
+    # ---- Section C: Albert's weekly cuts ----
+    st.markdown("---")
+    st.subheader("Weekly cuts (Albert continuity)")
+    wb_sheets = {}
+    if not wk.empty:
+        store_tbl = wk.groupby("Store", as_index=False)[["Total"] + DISCOUNT_BUCKET_NAMES].sum()
+        store_tbl["_s"] = store_tbl["Store"].map(store_sort_key)
+        store_tbl = store_tbl.sort_values("_s").drop(columns="_s")
+        st.markdown("**By store**")
+        st.dataframe(
+            store_tbl.style.format({c: "${:,.2f}" for c in ["Total"] + DISCOUNT_BUCKET_NAMES}),
+            use_container_width=True, hide_index=True,
+        )
+        wb_sheets["By store"] = store_tbl
+
+    def _cut(dim, title, with_store=False, top=None):
+        if det.empty:
+            return
+        sub = det[det["dimension"] == dim]
+        if sub.empty:
+            return
+        if with_store:
+            t = sub.groupby(["store", "label"], as_index=False).agg(
+                **{"Discount $": ("amount", "sum"), "Txns": ("txn_count", "sum")}
+            ).rename(columns={"store": "Store", "label": "Type"})
+        else:
+            t = sub.groupby("label", as_index=False).agg(
+                **{"Discount $": ("amount", "sum"), "Txns": ("txn_count", "sum")}
+            ).rename(columns={"label": title})
+        t = t.sort_values("Discount $", ascending=False)
+        full = t
+        if top:
+            t = t.head(top)
+        suffix = f" (top {top})" if top and len(full) > top else ""
+        st.markdown(f"**{title}**{suffix}")
+        st.dataframe(
+            t.style.format({"Discount $": "${:,.2f}"}),
+            use_container_width=True, hide_index=True,
+        )
+        wb_sheets[title[:31]] = full
+
+    _cut("by_promotion", "By promotion", top=25)
+    _cut("by_cart_promo", "By cart promo")
+    _cut("by_employee", "Employee by store")
+    _cut("by_member_group", "Member group", with_store=True)
+    _cut("discount_note", "Discount notes", top=50)
+
+    if wb_sheets:
+        buf = make_excel_download(wb_sheets)
+        st.download_button(
+            "Download workbook (Excel)", buf,
+            file_name=f"discounts_{'_'.join(sel_weeks) or 'period'}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="disc_workbook",
+        )
+
+    # ---- Section D: Change over time ----
+    st.markdown("---")
+    st.subheader("Change over time")
+    if weekly["week_id"].nunique() < 2:
+        st.info("Trends fill in as more weeks are stored. Showing what is on hand so far.")
+    st.caption("Weekly, Sun-Sat, across all stored weeks.")
+
+    by_wk = weekly.groupby("week_id", as_index=False)["Total"].sum().sort_values("week_id")
+    fig_total = go.Figure()
+    fig_total.add_trace(go.Scatter(
+        x=by_wk["week_id"], y=by_wk["Total"], mode="lines+markers",
+        line=dict(color=COLOR_ALERT, width=2),
+        hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
+    ))
+    apply_week_labels(fig_total, by_wk["week_id"])
+    fig_total.update_layout(title="Total discount by week", height=350, hovermode="x unified")
+    fig_total.update_yaxes(tickprefix="$")
+    st.plotly_chart(fig_total, use_container_width=True)
+
+    show_share = st.toggle("Show mix as share of total (%)", value=False, key="disc_share_toggle")
+    mix = weekly.groupby("week_id", as_index=False)[DISCOUNT_BUCKET_NAMES].sum().sort_values("week_id")
+    mlong = mix.melt(
+        id_vars="week_id", value_vars=DISCOUNT_BUCKET_NAMES,
+        var_name="Bucket", value_name="amount",
+    )
+    if show_share:
+        tot = mlong.groupby("week_id")["amount"].transform("sum").replace(0, pd.NA)
+        mlong["amount"] = (mlong["amount"] / tot).fillna(0)
+    fig_mix = px.area(
+        mlong, x="week_id", y="amount", color="Bucket",
+        color_discrete_map=DISCOUNT_BUCKET_TREND_COLORS,
+        category_orders={"Bucket": DISCOUNT_BUCKET_NAMES},
+    )
+    apply_week_labels(fig_mix, mlong["week_id"])
+    fig_mix.update_layout(
+        title="Discount mix by bucket over time" + (" (share)" if show_share else " ($)"),
+        height=380, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+    )
+    if show_share:
+        fig_mix.update_yaxes(tickformat=".0%")
+    else:
+        fig_mix.update_yaxes(tickprefix="$")
+    st.plotly_chart(fig_mix, use_container_width=True)
+
+    by_store = weekly.groupby(["week_id", "Store"], as_index=False)["Total"].sum().sort_values("week_id")
+    fig_store = px.line(by_store, x="week_id", y="Total", color="Store", markers=True)
+    apply_week_labels(fig_store, by_store["week_id"])
+    fig_store.update_layout(
+        title="Discount by store over time", height=420, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.4),
+    )
+    fig_store.update_yaxes(tickprefix="$")
+    st.plotly_chart(fig_store, use_container_width=True)
+
+    rate = weekly.groupby("week_id", as_index=False)[["Total", "Gross Retail"]].sum().sort_values("week_id")
+    rate["rate"] = rate.apply(
+        lambda r: (r["Total"] / r["Gross Retail"]) if r["Gross Retail"] else 0, axis=1
+    )
+    fig_rate = go.Figure()
+    fig_rate.add_trace(go.Scatter(
+        x=rate["week_id"], y=rate["rate"], mode="lines+markers",
+        line=dict(color=COLOR_PRIMARY, width=2),
+        hovertemplate="%{x}: %{y:.1%}<extra></extra>",
+    ))
+    apply_week_labels(fig_rate, rate["week_id"])
+    fig_rate.update_layout(
+        title="Discount rate (discount / gross retail) by week", height=340, hovermode="x unified",
+    )
+    fig_rate.update_yaxes(tickformat=".1%")
+    st.plotly_chart(fig_rate, use_container_width=True)
+
+
 def main():
-    st.title(f"📉 Shrinkage Dashboard v{VERSION}")
+    st.title(f"📉 Retail Reporting v{VERSION}")
 
     sheets_ok = has_sheets_config()
 
@@ -1291,8 +1778,10 @@ def main():
             with st.spinner("Processing uploads..."):
                 recon_upload = load_recon_csv(file_recon)
                 sales_upload = load_sales_csv(file_sales)
+                discount_weekly_up, discount_detail_up = load_discount_csv(file_sales)
                 if recon_upload is not None and sales_upload is not None:
                     upload_weeks = set(recon_upload["week_id"].dropna().unique())
+                    appended_any = False
                     if sheets_ok:
                         existing = get_stored_week_ids()
                         dupes = upload_weeks & existing
@@ -1302,17 +1791,41 @@ def main():
                             )
                             recon_upload = recon_upload[~recon_upload["week_id"].isin(dupes)]
                             sales_upload = sales_upload[~sales_upload["week_id"].isin(dupes)]
-                    if not recon_upload.empty:
-                        if sheets_ok:
+                        # Discounts ride the same Total Sales Detail file but dedup
+                        # against their own worksheet (accumulation started later).
+                        if discount_weekly_up is not None and not discount_weekly_up.empty:
+                            d_existing = get_stored_week_ids(DISCOUNT_WEEKLY_WS)
+                            d_new = set(discount_weekly_up["week_id"].dropna().unique()) - d_existing
+                            dw = discount_weekly_up[discount_weekly_up["week_id"].isin(d_new)]
+                            dd = (discount_detail_up[discount_detail_up["week_id"].isin(d_new)]
+                                  if discount_detail_up is not None else pd.DataFrame())
+                            if not dw.empty:
+                                ensure_worksheet(DISCOUNT_WEEKLY_WS, DISCOUNT_WEEKLY_HEADER)
+                                ensure_worksheet(DISCOUNT_DETAIL_WS, DISCOUNT_DETAIL_HEADER)
+                                append_to_sheets(dw, DISCOUNT_WEEKLY_WS)
+                                if dd is not None and not dd.empty:
+                                    append_to_sheets(dd, DISCOUNT_DETAIL_WS)
+                                load_discount_weekly_from_sheets.clear()
+                                load_discount_detail_from_sheets.clear()
+                                appended_any = True
+                        if not recon_upload.empty:
                             append_to_sheets(recon_upload, RECON_WORKSHEET)
                             append_to_sheets(sales_upload, SALES_WORKSHEET)
                             load_recon_from_sheets.clear()
                             load_sales_from_sheets.clear()
-                        else:
-                            prev_r = st.session_state.get("recon_data", pd.DataFrame())
-                            prev_s = st.session_state.get("sales_data", pd.DataFrame())
-                            st.session_state["recon_data"] = pd.concat([prev_r, recon_upload], ignore_index=True)
-                            st.session_state["sales_data"] = pd.concat([prev_s, sales_upload], ignore_index=True)
+                            appended_any = True
+                    else:
+                        prev_r = st.session_state.get("recon_data", pd.DataFrame())
+                        prev_s = st.session_state.get("sales_data", pd.DataFrame())
+                        st.session_state["recon_data"] = pd.concat([prev_r, recon_upload], ignore_index=True)
+                        st.session_state["sales_data"] = pd.concat([prev_s, sales_upload], ignore_index=True)
+                        if discount_weekly_up is not None and not discount_weekly_up.empty:
+                            prev_dw = st.session_state.get("discount_weekly_data", pd.DataFrame())
+                            prev_dd = st.session_state.get("discount_detail_data", pd.DataFrame())
+                            st.session_state["discount_weekly_data"] = pd.concat([prev_dw, discount_weekly_up], ignore_index=True)
+                            st.session_state["discount_detail_data"] = pd.concat([prev_dd, discount_detail_up], ignore_index=True)
+                        appended_any = True
+                    if appended_any:
                         st.sidebar.success(f"Uploaded {len(upload_weeks)} week(s)")
                         st.rerun()
                     else:
@@ -1327,9 +1840,13 @@ def main():
     if sheets_ok:
         all_recon = load_recon_from_sheets()
         all_sales = load_sales_from_sheets()
+        all_discount_weekly = load_discount_weekly_from_sheets()
+        all_discount_detail = load_discount_detail_from_sheets()
     else:
         all_recon = st.session_state.get("recon_data", pd.DataFrame())
         all_sales = st.session_state.get("sales_data", pd.DataFrame())
+        all_discount_weekly = st.session_state.get("discount_weekly_data", pd.DataFrame())
+        all_discount_detail = st.session_state.get("discount_detail_data", pd.DataFrame())
     has_data = not all_recon.empty and not all_sales.empty
 
     if not has_data:
@@ -1445,9 +1962,10 @@ def main():
     # ----------------------------------------------------------------
     # Tabs
     # ----------------------------------------------------------------
-    tab1, tab_accounting, tab_compliance, tab_workbook, tab3, tab4, tab5, tab7 = st.tabs([
+    tab1, tab_accounting, tab_discounts, tab_compliance, tab_workbook, tab3, tab4, tab5, tab7 = st.tabs([
         "📈 Trends",
         "🧾 Accounting",
+        "💳 Discounts",
         "✅ Reason Code Audit",
         "📝 Per-Store Homework",
         "📋 Legacy Shrink",
@@ -1530,6 +2048,12 @@ def main():
             st.dataframe(ac_styled, use_container_width=True, hide_index=True)
 
             download_buttons(ac_with_total, "accounting_by_location", "ac")
+
+    # == Tab Discounts ==
+    with tab_discounts:
+        render_discounts_tab(
+            all_discount_weekly, all_discount_detail, selected_period, period_key
+        )
 
     # == Tab Compliance Audit ==
     with tab_compliance:
