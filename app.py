@@ -11,6 +11,12 @@ Report types filter by reason groupings:
 - Samples, Display, Damaged, Expired, Other: individual groups
 
 CHANGELOG:
+v2.7.1 (2026-06-23)
+- Blaze changed the Total Sales Detail export format: "Product Category" was
+  renamed to "Category" (and a mostly-empty "Sub Category" plus four trailing
+  columns were added). load_sales_csv now accepts either category name, so the
+  new export loads and historical files still re-upload cleanly. The Discounts
+  module was unaffected (its source columns are unchanged).
 v2.7.0 (2026-06-01)
 - Renamed "Shrinkage Dashboard" to "Retail Reporting"; the app now hosts
   shrinkage plus a new Discounts module off the same Total Sales Detail upload.
@@ -207,7 +213,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 
 # Email of the human owner of this app. used to auto-share newly-created
 # homework Google Sheets so Charles can see them in his Drive.
@@ -256,7 +262,10 @@ RECON_STORE_COLS = [
     "Old Quantity", "New Quantity", "Difference", "Metrc Adjustment",
     "Cost per Unit", "COGS", "Reason", "Reason Note",
 ]
-SALES_REQUIRED_COLS = ["Date", "Shop", "Product Category", "COGS"]
+# Blaze renamed "Product Category" -> "Category" in the 6/23/2026 Total Sales Detail
+# export (and added a mostly-empty "Sub Category"). load_sales_csv accepts either name.
+SALES_REQUIRED_COLS = ["Date", "Shop", "Category", "COGS"]
+SALES_CATEGORY_COLS = ["Category", "Product Category"]  # preferred first
 
 # -- Discounts (Retail Reporting) --
 # Pulled from the SAME Blaze Total Sales Detail export that feeds sales COGS.
@@ -881,16 +890,29 @@ def load_recon_csv(uploaded_file):
 
 
 def load_sales_csv(uploaded_file):
-    """Load Total Sales Detail CSV, extract needed columns, aggregate by week+store+category."""
+    """Load Total Sales Detail CSV, extract needed columns, aggregate by week+store+category.
+
+    Tolerates either the new "Category" column (6/23/2026 Blaze export) or the legacy
+    "Product Category" so historical files still re-upload cleanly.
+    """
+    # Read only the columns we need, by either category name. A callable usecols won't
+    # raise on a missing column, so we validate after the read instead.
+    wanted = {"Date", "Shop", "COGS"} | set(SALES_CATEGORY_COLS)
     try:
         df = pd.read_csv(
             uploaded_file,
-            usecols=["Date", "Shop", "Product Category", "COGS"],
+            usecols=lambda c: c in wanted,
             low_memory=False,
         )
-    except ValueError:
+    except Exception:
+        st.error("Could not read the Total Sales Detail CSV.")
+        return None
+
+    cat_col = next((c for c in SALES_CATEGORY_COLS if c in df.columns), None)
+    missing = [c for c in ("Date", "Shop", "COGS") if c not in df.columns]
+    if cat_col is None or missing:
         st.error(
-            "Could not find required columns (Date, Shop, Product Category, COGS) "
+            "Could not find required columns (Date, Shop, Category, COGS) "
             "in the Total Sales Detail CSV."
         )
         return None
@@ -902,9 +924,9 @@ def load_sales_csv(uploaded_file):
 
     # Aggregate to week + store + category level (~200 rows per week)
     agg = (
-        df.groupby(["week_id", "Store", "Product Category"], as_index=False)["COGS"]
+        df.groupby(["week_id", "Store", cat_col], as_index=False)["COGS"]
         .sum()
-        .rename(columns={"Product Category": "Category", "COGS": "Sales COGS"})
+        .rename(columns={cat_col: "Category", "COGS": "Sales COGS"})
     )
     agg["uploaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return agg
